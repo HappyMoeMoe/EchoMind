@@ -1,794 +1,1372 @@
-# EchoMind 学习文档
+## 1\. 项目定位
 
-这是一份把项目定位、业务流程、关键代码、使用方式和技术亮点合并后的学习文档。内容基于当前代码实现重写，尽量按“先看懂系统，再看懂代码，最后能跑起来”的顺序组织。
+EchoMind 是一个面向复杂客服任务的多 Agent 客服。
 
-## 1. 项目定位
-
-EchoMind 是一个面向复杂客服任务的多 Agent 客服编排运行时。
-
-它解决的不是“能聊天”，而是这类真实问题：
+它解决的不是"能聊天"，而是这类真实问题：
 
 - 用户一次说多个诉求，既有技术问题也有账单问题
+
 - 用户信息不完整，需要系统先追问再处理
+
 - 用户要转人工或场景紧急，系统要能升级
+
 - 知识库要能接入真实业务规则，而不是只靠模型记忆
+
 - 系统要能评测、监控、降权、回归，形成闭环
 
 从工程上看，它的目标不是单纯堆一个更强的模型，而是把客服系统里最容易出问题的几层拆开处理：
 
-- 先判断“这句话到底在问什么”
-- 再判断“该谁来处理”
-- 再判断“需不需要查知识库”
-- 再判断“要不要补充信息、要不要升级”
+- 先判断"这句话到底在问什么"
+
+- 再判断"该谁来处理"
+
+- 交给对应 Agent 后，由 Agent 自己判断"需不需要查知识库"
+
+- 再判断"要不要补充信息、要不要升级"
+
 - 最后把结果写回记忆和监控系统
 
 这类拆分的意义在于，客服系统真正难的地方往往不是生成回复，而是前面的判断链条。如果前面几步错了，后面模型再强也会答偏。
 
-## 2. 总体架构
+### 1\.1 系统入口在哪里
 
-```text
+整套系统的进程入口是 `api/main.py`，启动时打印一个小熊 banner，然后在 FastAPI 的 `lifespan()` 里完成所有核心组件的初始化：
+
+```Python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager
+    ...
+    _skill_manager = SkillManager(root_dir=skills_dir, max_prompt_chars=...)
+    _skill_manager.load()
+
+    _orchestrator = AgentOrchestrator(api_key=cfg["api_key"], ..., skill_manager=_skill_manager)
+
+    _memory = MemoryManager(redis_url=..., chroma_host=..., chroma_port=..., ...)
+
+    _tool_manager = MCPToolManager(api_key=..., base_url=..., model=...)
+    kb = KnowledgeBase(chroma_host=..., chroma_port=..., chroma_path=...)
+    _tool_manager.register(Tool(name="knowledge_search", handler=kb.search_handler, ...))
+    _orchestrator.set_shared_tools(build_shared_rag_tools(_tool_manager))
+
+    _monitor = PerformanceMonitor(orchestrator=_orchestrator, tool_manager=_tool_manager, ...)
+    await _monitor.start()
+
+    _evaluator = EndToEndEvaluator(orchestrator=_orchestrator, recognizer=recognizer, ...)
+    yield
+    await _monitor.stop()
+    await _memory.close()
+```
+
+这段代码本身就是理解全局架构的最佳入口：**一次启动会创建 6 个核心对象**（`SkillManager`、`AgentOrchestrator`、`MemoryManager`、`MCPToolManager` \+ `KnowledgeBase`、`PerformanceMonitor`、`EndToEndEvaluator`），它们互相持有引用，共同支撑 `/chat` 主链路。
+
+注意几个容易忽略的细节：
+
+- `IntentRecognizer` 会被创建两次：一次在 `AgentOrchestrator.__init__()` 内部（用于真实路由），一次在 `lifespan()` 里单独创建（专门暴露给 `EndToEndEvaluator` 做意图识别评测）。两者配置相同，但是独立实例、独立缓存。
+
+- 知识库工具在注册时带了 `cache_ttl=300.0`（5 分钟缓存）、`supports_rerank=True`（支持结果重排）和一个 `knowledge_fallback` 降级函数——知识库整体不可用时不会报错，而是返回一段说明性文字。
+
+- `_anthropic_cfg()` 会强制要求 `ANTHROPIC_API_KEY`，否则直接抛异常阻止启动；`ANTHROPIC_BASE_URL` 是可选的，配置后即可接入 DeepSeek 等兼容 Anthropic 协议的第三方模型。
+
+## 2\. 总体架构
+
+```Plaintext
 用户请求
   -> /chat
-  -> MemoryManager 读取工作记忆、情景记忆、用户画像、摘要
+  -> MemoryManager 读取工作记忆、情景记忆、用户画像
   -> IntentRecognizer 三路融合识别细粒度意图、紧急度、实体
-  -> 按意图决定是否触发知识库检索
   -> AgentOrchestrator 生成结构化路由决策
      - primary_agent
      - supporting_agents
      - routing_reason
      - routing_confidence
-  -> 调用对应 Agent
-  -> 注入记忆、知识库、结构化实体、Skills
+  -> 调用对应 Agent（Agent 在 LLM 工具调用循环中自主决定是否检索知识库）
+  -> 注入记忆、结构化实体、Skills；按需调用 search_knowledge_base 工具
   -> LLM 生成回复
   -> 写回工作记忆
   -> 异步更新用户画像
   -> Monitor 和 Evaluator 形成观测与评测闭环
 ```
 
-### 2.1 为什么是这个顺序
+### 2\.1 为什么是这个顺序
 
 这个顺序对应的是客服系统最常见的依赖关系：
 
 1. **记忆先行**：没有上下文，很多问题会被误判成新问题。
-2. **意图优先**：只有先知道用户大概在问什么，才能决定要不要查知识库。
-3. **知识库前置**：业务类问题如果完全靠模型回忆，容易出现事实错误。
-4. **路由决策**：不同领域的问题要交给不同 Agent，避免一个 prompt 处理所有场景。
-5. **记忆回写**：系统每轮都要把新信息沉淀回去，否则多轮就失真。
-6. **监控评测闭环**：没有闭环，系统只能“看起来能用”，不能持续优化。
 
-### 2.2 这个架构和普通 Chatbot 的区别
+2. **意图优先**：只有先知道用户大概在问什么，才能决定路由给哪个 Agent。
+
+3. **路由决策**：不同领域的问题要交给不同 Agent，避免一个 prompt 处理所有场景。
+
+4. **知识库按需检索**：Agent 在生成回复的过程中，会根据当前问题和角色契约自主判断是否需要调用知识库工具，而不是在路由之前统一预判——业务类问题如果完全靠模型回忆，容易出现事实错误，所以关键事实类问题通常会触发检索。
+
+5. **记忆回写**：系统每轮都要把新信息沉淀回去，否则多轮就失真。
+
+6. **监控评测闭环**：没有闭环，系统只能"看起来能用"，不能持续优化。
+
+### 2\.2 这个架构和普通 Chatbot 的区别
 
 普通 chatbot 往往是：
 
-```text
+```Plaintext
 用户消息 -> 单一 LLM -> 回复
 ```
 
 EchoMind 是：
 
-```text
-用户消息 -> 记忆 -> 意图 -> 知识库 -> 路由 -> 工具 -> 回复 -> 回写 -> 评测 -> 监控
+```Plaintext
+用户消息 -> 记忆 -> 意图 -> 路由 -> Agent 执行（按需调用知识库等工具）-> 回复 -> 回写 -> 评测 -> 监控
 ```
 
-差别不只是多了几个模块，而是把“回答能力”拆成了几个可治理的能力层。
+差别不只是多了几个模块，而是把"回答能力"拆成了几个可治理的能力层。
 
-## 3. 核心业务流程
+### 2\.3 请求级数据结构 `Request`
 
-### 3.1 `/chat` 主链路
+真正贯穿全链路的数据对象是 `agents/agent_orchestrator.py` 里的 `Request`（一个 `dataclass`）：
 
-入口在 [api/main.py](/Users/xiao_xiong/Desktop/code/EchoMind/api/main.py)。
+```Python
+@dataclass
+class Request:
+    message:     str
+    user_id:     str
+    conv_id:     str
+    context:     str = ""        # 来自 MemoryManager 的格式化上下文
+    history:     Optional[List[Dict[str, str]]] = None
+    entities:    Dict[str, List[str]] = field(default_factory=dict)
+    intent:      Optional[IntentCategory] = None
+    intent_group: Optional[str] = None
+    urgency:     Optional[UrgencyLevel]   = None
+    intent_confidence: float = 1.0
+    request_id:  str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+```
 
-当前链路是：
+`/chat` 里会先做记忆读取和意图识别，再把结果一次性塞进这个 `Request`，后续所有 Agent、工具、Skills 都从这个对象里取数据，不再重复识别。`request_id` 默认自动生成，也支撑了后面 `/trace/tool/{request_id}` 这类调试接口。
 
-1. 读取 Redis 工作记忆、ChromaDB 情景记忆和用户画像
-2. 构造最近对话历史，供意图识别使用
-3. 先做三路融合意图识别
-4. 根据意图判断是否调用知识库
-5. 生成路由决策
-6. 调用主 Agent 或主辅 Agent
-7. 写回记忆，并异步更新画像
+## 3\. 核心业务流程
 
-这里有两个关键细节：
+### 3\.1 `/chat` 主链路
 
-- **意图识别在 Agent 之前**，因为它决定是否需要知识库、是否需要澄清、是否应该直接升级。
-- **画像更新是异步的**，因为它属于“延后沉淀”，不应该拖慢用户当前请求。
+入口在 `api/main.py` 的 `chat()` 路由函数。当前实现的关键代码（已按真实顺序摘录）：
 
-### 3.2 什么时候切 Agent
+```Python
+@app.post("/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest):
+    conv_id = req.conv_id or str(uuid.uuid4())
 
-- 技术类问题 -> `TechnicalAgent`
-- 账单、退款、发票、支付异常 -> `BillingAgent`
-- 普通咨询 -> `GeneralAgent`
-- 明确要求人工、或高风险升级 -> `EscalationAgent`
+    # 1. 读取记忆上下文
+    mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
 
-这背后的原则是“按风险和职责切分”：
+    # 2. 构建编排请求（含对话历史，用于意图识别上下文）
+    history = [
+        {"role": m.role.value, "content": m.content}
+        for m in mem_ctx.recent_messages[-5:]
+    ] if mem_ctx.recent_messages else None
 
-- 通用 Agent 负责第一层接待，不承担深排障和资金处理责任
-- 技术 Agent 专注于错误码、环境、版本、复现路径
-- 账单 Agent 专注于订单、金额、支付、退款、发票
-- 升级 Agent 则负责把已知信息整理干净，交给人工继续处理
+    intent_result = await _orchestrator.recognize_intent(req.message, history=history)
+    full_context = mem_ctx.to_prompt_text()
 
-这样做的好处是每个 Agent 的 prompt 更短，工具边界更清楚，风险更容易控制。
+    orch_req = OrcReq(
+        message=req.message, user_id=req.user_id, conv_id=conv_id,
+        context=full_context, history=history,
+        entities=intent_result.entities,
+        intent=intent_result.intent,
+        intent_group=intent_result.intent_group,
+        urgency=intent_result.urgency,
+        intent_confidence=intent_result.confidence,
+    )
 
-### 3.3 什么时候并行协作
+    # 3. 执行
+    result = await _orchestrator.run(orch_req)
 
-当一个请求同时命中多个领域时，会同时派发多个 Agent，然后由编排器合并结果。
+    # 4. 写入记忆
+    await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message)
+    await _memory.add_message(req.user_id, conv_id, MsgRole.ASSISTANT, result.response)
+
+    # 5. 异步更新用户画像（不阻塞响应）
+    asyncio.create_task(_memory.update_profile(req.user_id, conv_id))
+
+    return ChatResponse(...)
+```
+
+这里有几个容易被忽略但很重要的细节：
+
+- **意图识别时用的对话历史只有最近 5 条**（`mem_ctx.recent_messages[-5:]`），不是把整个工作记忆都塞给意图识别器，目的是控制 LLM Few\-shot prompt 的长度。
+
+- **`full_context`**** 直接就是 ****`MemoryContext.to_prompt_text()`**** 的输出**，这个方法内部已经把摘要、相关历史、用户画像、最近对话拼成了一段文本（详见第 4\.4 节），主链路不需要再单独处理知识库文本拼接——当前代码里知识库检索是**由 Agent 通过 ****`search_knowledge_base`**** 工具主动调用**，而不是在 `/chat` 里预先拼接（这一点和早期设计文档描述略有差异，属于当前真实实现）。
+
+- **`ChatResponse`**** 里的 ****`knowledge_used`**** 字段**是通过检查 `"search_knowledge_base" in result.tools_used` 反推出来的，说明知识库调用与否是 Agent 在对话过程中动态决定的，而不是外层强制注入。
+
+- 画像更新用 `asyncio.create_task()` 直接丢到后台，不 `await`，所以即使 LLM 摘要生成慢也不会拖慢当次响应。
+
+### 3\.2 什么时候切 Agent
+
+Agent 路由主要靠 `agents/agent_orchestrator.py` 里的静态映射表 `_INTENT_ROUTING`：
+
+```Python
+_INTENT_ROUTING: Dict[IntentCategory, AgentType] = {
+    IntentCategory.TECHNICAL:  AgentType.TECHNICAL,
+    IntentCategory.TECHNICAL_LOGIN: AgentType.TECHNICAL,
+    IntentCategory.TECHNICAL_CRASH: AgentType.TECHNICAL,
+    IntentCategory.BILLING:    AgentType.BILLING,
+    IntentCategory.REFUND:     AgentType.BILLING,
+    IntentCategory.INVOICE:    AgentType.BILLING,
+    IntentCategory.PAYMENT_ISSUE: AgentType.BILLING,
+    IntentCategory.ACCOUNT:    AgentType.BILLING,
+    IntentCategory.ACCOUNT_SECURITY: AgentType.BILLING,
+    IntentCategory.ESCALATION: AgentType.ESCALATION,
+    IntentCategory.HUMAN_HANDOFF: AgentType.ESCALATION,
+    # 其余意图 → GENERAL（默认）
+}
+```
+
+但真正的路由决策不是简单查表，而是走 `_route_decision()`，它按顺序做了这几层判断：
+
+1. **紧急度优先**：`req.urgency == UrgencyLevel.CRITICAL` 时，无条件路由到 `EscalationAgent`，置信度直接给 1\.0。
+
+2. **升级意图优先**：`intent` 是 `ESCALATION` 或 `HUMAN_HANDOFF` 时，也直接路由到 `EscalationAgent`。
+
+3. **领域打分**：调用 `_domain_scores(req)` 给 `GENERAL/TECHNICAL/BILLING` 三类 Agent 打分（打分逻辑见 3\.3 节）。
+
+4. **监控降权过滤**：`_monitor_degraded(agent_type)` 检查该类型 Agent 是否被 Monitor 判定为"全体实例降权过高"，如果是则从可选池中剔除。
+
+5. **选最高分作为主 Agent**，再看是否需要辅助 Agent（见 3\.3 节）。
+
+技术类问题会命中 `TechnicalAgent`，账单/账户类命中 `BillingAgent`，普通咨询命中 `GeneralAgent`，转人工/危急场景命中 `EscalationAgent`——这是结果表现，但背后是打分 \+ 过滤的动态过程，不是死板的 if\-else。
+
+### 3\.3 什么时候并行协作
+
+`_domain_scores(req)` 会综合意图类别、关键词命中、结构化实体三类信号打分，起始分是：
+
+```Python
+scores = {AgentType.GENERAL: 0.1, AgentType.TECHNICAL: 0.0, AgentType.BILLING: 0.0}
+```
+
+然后按以下规则加分：
+
+- 意图属于 `QUERY/ORDER_STATUS/LOGISTICS/REQUEST/COMPLAINT/GREETING/FEEDBACK/OTHER` → `GENERAL += 0.55`
+
+- 意图属于 `TECHNICAL/TECHNICAL_LOGIN/TECHNICAL_CRASH` → `TECHNICAL += 0.75`
+
+- 意图属于 `BILLING/ACCOUNT/ACCOUNT_SECURITY/REFUND/INVOICE/PAYMENT_ISSUE` → `BILLING += 0.75`
+
+- 关键词命中（如"崩溃/报错/error/crash/无法登录/500/401"）→ `TECHNICAL += min(0.45, hits * 0.18)`
+
+- 关键词命中（如"退款/退货/扣款/发票/账单/支付"）→ `BILLING += min(0.45, hits * 0.18)`
+
+- 实体命中：有 `error_code` → `TECHNICAL += 0.2`；有 `amount` → `BILLING += 0.15`；有 `order_id` → `GENERAL += 0.1`
+
+是否并行协作由单独的 `_collaboration_targets(req)` 判断，它不依赖打分结果，而是**直接检测消息里是否同时出现技术和账单两类信号**（意图或关键词命中即可）：
+
+```Python
+if req.intent in (TECHNICAL, TECHNICAL_LOGIN, TECHNICAL_CRASH) or any(kw in msg for kw in technical_kws):
+    targets.append(AgentType.TECHNICAL)
+if req.intent in (BILLING, ACCOUNT, ACCOUNT_SECURITY, REFUND, INVOICE, PAYMENT_ISSUE) or any(kw in msg for kw in billing_kws):
+    targets.append(AgentType.BILLING)
+```
 
 例如：
 
-```text
+```Plaintext
 登录一直 401，而且刚才还重复扣款了
 ```
 
-可能会得到：
+- 命中 `技术关键词`（401）和 `账单关键词`（重复扣款）
 
-- 主 Agent：`technical`
-- 辅助 Agent：`billing`
+- `_route_decision()` 算出主 Agent（比如 `technical` 分数更高），辅助 Agent 是 `billing`
 
-这种“主辅协作”比“简单多路并发回复”更像真实业务协作：
+- 触发 `run_parallel()`，`asyncio.gather()` 同时调用两个 Agent
 
-- 主 Agent 负责给出主结论
-- 辅助 Agent 负责补充另一个领域的证据或限制
-- 最终由编排器统一成一段可读回复
+- 最终由 `ResponseComposer.compose()` 把两份结果合并成一条回复
 
-它的价值在于，用户不需要自己理解“这是两个模型说的话”，系统会替用户整理成一个结果。
+如果 `_collaboration_targets()` 没检测到辅助目标，还有一个兜底规则：分数第二高的 Agent 只要 `score >= 0.45` 且 `score >= primary_score * 0.55`，也会被补充为辅助 Agent（避免遗漏"分数接近但关键词没显式命中"的情况）。
 
-### 3.4 什么时候降级
+`ResponseComposer.compose()` 内部逻辑：
 
-- 专业 Agent 不可用
-- 置信度不足
-- 请求超出当前角色边界
+- 只有一个成功响应时，直接原样返回，不额外调用 LLM。
 
-此时会降级到 `GeneralAgent` 或升级到 `EscalationAgent`。
+- 多个成功响应时，构造一个"以主 Agent 结论为主、去重冲突表述、不能编造订单/退款操作"的合并 prompt，再调用一次 LLM 生成最终回复。
 
-这一步很重要，因为它避免系统“硬答”：
+- 如果合并 LLM 调用失败，会降级为确定性拼接（主 Agent 内容 \+ "补充说明：" \+ 其他 Agent 内容），保证任何情况下都有输出。
 
-- 不够确定时，先问必要字段
-- 风险太高时，直接交给人工
-- 专业 Agent 掉线或失败时，先保底返回通用接待逻辑
+### 3\.4 什么时候降级
 
-比起让系统在不确定场景下胡说，明确降级反而更符合客服场景的生产要求。
+降级分两层，都在代码里能直接找到：
 
-### 3.5 什么时候压缩记忆
+**第一层：路由前的监控降级**（`_monitor_degraded()`）
 
-当工作记忆超过阈值时，旧消息会被压缩成摘要：
+```Python
+def _monitor_degraded(self, agent_type: AgentType) -> bool:
+    if agent_type in (AgentType.GENERAL, AgentType.ESCALATION):
+        return False
+    agents = self._pool.get(agent_type, [])
+    threshold = _env_float("ECHOMIND_MONITOR_FALLBACK_PENALTY", self.MONITOR_FALLBACK_PENALTY)  # 默认 0.5
+    penalties = [agent.stats.monitor_penalty for agent in agents]
+    return min(penalties) >= min(max(threshold, 0.0), 0.9)
+```
 
-- 旧消息 -> LLM 摘要
-- 摘要写入 Redis
-- 旧消息写入 ChromaDB 情景记忆
-- 工作记忆只保留最近少量消息
+只要该类型下**还有一个实例**的 `monitor_penalty` 低于阈值，就不算全体降级，继续可用；只有全部实例都被打到高降权才会从候选池里剔除，强制回退到 `GENERAL`。
 
-当前实现里，用户画像也改成了按用户稳定存储，避免按会话漂移。
+**第二层：执行时的失败降级**（`_execute()`）
 
-压缩的真正目的不是“省一点字数”，而是防止上下文膨胀之后把高价值信息冲掉。  
-客服场景里，最近几轮消息通常最重要，但前面的历史也不能全丢，所以才有“摘要 + 最近若干轮 + 长期画像”的组合。
+```Python
+async def _execute(self, req: Request, agent_type: AgentType) -> AgentResponse:
+    agent = self._best_agent(agent_type)
+    if agent is None:
+        agent = self._best_agent(AgentType.GENERAL)
+    ...
+    response = await agent.handle(req)
+    if not response.success and agent_type not in (AgentType.GENERAL, AgentType.ESCALATION):
+        logger.warning(f"{agent_type.value} 失败，降级到 GeneralAgent")
+        fallback = self._best_agent(AgentType.GENERAL)
+        if fallback:
+            response = await fallback.handle(req)
+    return response
+```
 
-## 4. 关键模块
+也就是说：即使路由选中了 `TechnicalAgent`，只要它这次调用真的失败了（比如 LLM 报错、工具调用超出最大轮数），也会立刻重新调用 `GeneralAgent` 兜底，而不是把错误直接抛给用户。
 
-### 4.1 意图识别
+**低置信度时不路由，先澄清**（`_needs_clarification()`）：
+
+```Python
+@staticmethod
+def _needs_clarification(req: Request) -> bool:
+    if req.intent != IntentCategory.OTHER:
+        return False
+    text = (req.message or "").strip()
+    if len(text) <= 2:
+        return False
+    return req.intent_confidence < 0.5
+```
+
+当意图识别结果是 `OTHER` 且置信度低于 0\.5（消息长度大于 2 个字符时才生效，避免对"你好"这种极短语句误判），`AgentOrchestrator.run()` 会直接返回一条固定的澄清话术，完全不进入 Agent 执行流程：
+
+> "我还不能确定您要处理的是哪类问题。请补充一下是订单物流、退款账单、账户资料，还是技术故障？"
+
+### 3\.5 什么时候压缩记忆
+
+压缩逻辑在 `MemoryManager._compress()`，触发条件是工作记忆条数达到 `COMPRESS_AT = 15`（在 `add_message()` 里每次写入后检查 `await self._redis.llen(key) >= self.COMPRESS_AT`）。
+
+压缩流程（完全对应代码顺序）：
+
+1. 取出全部工作记忆，`to_compress = messages[:-5]`（除最近 5 条外的全部旧消息），`keep = messages[-5:]`
+
+2. 用 LLM 生成 2\-3 句摘要：`"用 2-3 句话总结以下对话的关键信息：..."`
+
+3. 调用 `_merge_summary(old_summary, new_summary)` 把新摘要和旧摘要**再用一次 LLM 合并**成不超过 `SUMMARY_MAX_CHARS = 800` 字符的新摘要，写回 Redis（`setex`，24 小时 TTL）
+
+4. 旧消息全文存入 ChromaDB `episodic` collection（`_store_episodic`），供后续跨会话语义检索
+
+5. 工作记忆用 Redis `delete` \+ 重新 `lpush` 只保留最近 5 条
+
+`_merge_summary()` 特别值得注意：如果合并 LLM 调用失败，会退化为字符串拼接后截断（`(old + "\n" + new)[-800:]`），保证摘要压缩这个动作永远不会因为一次 LLM 失败而彻底失效。
+
+当前实现里，用户画像不再按会话存储，而是**按 ****`user_id`**** 全局稳定存储**（`doc_id = f"user_profile:{user_id}"`），每次 `update_profile()` 都会先读旧画像、再让 LLM 结合新对话增量更新，避免跨会话之间画像互相覆盖或丢失。
+
+压缩的真正目的不是"省一点字数"，而是防止上下文膨胀之后把高价值信息冲掉。客服场景里，最近几轮消息通常最重要，但前面的历史也不能全丢，所以才有"摘要 \+ 最近若干轮 \+ 长期画像"的组合。
+
+## 4\. 关键模块
+
+### 4\.1 意图识别
 
 文件：`core/intent_recognizer.py`
 
-EchoMind 的意图识别不是单模型分类，而是三路融合：
+EchoMind 的意图识别不是单模型分类，而是三路融合，并且带缓存和在线学习能力。核心类是 `IntentRecognizer`。
 
-- LLM 语义理解
-- Embedding 相似度
-- Pattern 关键词匹配
+#### 4\.1\.1 支持的意图分类（`IntentCategory`）
 
-输出包括：
+代码里定义了 18 个意图类别：
 
-- `intent`
-- `intent_group`
-- `confidence`
-- `source_scores`
-- `urgency`
-- `entities`
+```Python
+class IntentCategory(Enum):
+    QUERY = "query"; COMPLAINT = "complaint"; REQUEST = "request"; GREETING = "greeting"
+    ESCALATION = "escalation"; TECHNICAL = "technical"; BILLING = "billing"; ACCOUNT = "account"
+    FEEDBACK = "feedback"; ORDER_STATUS = "order_status"; LOGISTICS = "logistics"
+    REFUND = "refund"; INVOICE = "invoice"; PAYMENT_ISSUE = "payment_issue"
+    ACCOUNT_SECURITY = "account_security"; TECHNICAL_LOGIN = "technical_login"
+    TECHNICAL_CRASH = "technical_crash"; HUMAN_HANDOFF = "human_handoff"; OTHER = "other"
+```
 
-#### 代码里是怎么做的
+这些细粒度意图会通过 `_INTENT_GROUPS` 归一化到几个大类（`intent_group`），供路由和 Skills 匹配使用，比如 `REFUND/INVOICE/PAYMENT_ISSUE` 都归一化为 `billing` 组，`TECHNICAL_LOGIN/TECHNICAL_CRASH` 归一化为 `technical` 组。
 
-`recognize()` 里会同时启动：
+#### 4\.1\.2 识别链路：`recognize()`
 
-- `llm_task`
-- `emb_task`
-- 同步的 pattern 识别
+```Python
+async def recognize(self, message: str, history=None) -> IntentResult:
+    key = self._cache_key(message, history)
+    if key in self._cache:
+        self.cache_hits += 1
+        return self._cache[key]
+    self.cache_misses += 1
 
-然后用 `_vote()` 融合结果。这样做的好处是：  
-LLM 负责语义理解，Embedding 负责模板相似度，Pattern 负责即时兜底，三者互补。
+    llm_task = asyncio.create_task(self._llm_recognize(message, history))
+    emb_task = asyncio.create_task(self._embedding_recognize(message)) if self._embedding_enabled else None
+    pat      = self._pattern_recognize(message)          # 同步执行，零延迟
 
-#### 为什么这样设计
+    llm, emb = await asyncio.gather(llm_task, emb_task) if emb_task else (await llm_task, {...})
 
-- LLM 负责复杂语义
-- Embedding 负责模板相似度
-- Pattern 负责零延迟兜底
-- 三路并行，减少串行耗时
+    intent, confidence, source_scores = self._vote(llm, emb, pat)
+    entities = self._extract_entities(message)
+    urgency  = self._urgency(message, intent)
+    ...
+```
 
-更具体一点：
+三路策略分别是：
 
-- 只有 LLM 时，成本高且容易受提示词波动影响
-- 只有 Pattern 时，覆盖窄，稍微换个说法就失效
-- 只有 Embedding 时，对细粒度业务边界不够稳定
+- **LLM Few\-shot**（`_llm_recognize`）：用每个意图类别取 1 条模板样本拼成 Few\-shot 示例，再加上最近 3 轮对话作为上下文，让 LLM 返回 JSON 格式的 `{"intent", "confidence", "reasoning"}`。Prompt 里特别强调"如果用户问题能匹配细粒度业务意图，请优先返回细粒度意图，而不是宽泛大类"——这是为了让 LLM 主动倾向细粒度分类。
 
-三路融合的价值不是“多路总比一路强”，而是让不同错误类型互相纠正。
+- **Embedding 相似度**（`_embedding_recognize`）：先懒加载所有模板的向量（`_load_template_embeddings`，只在首次调用时执行且带缓存），再算用户消息向量和各类模板向量的余弦相似度，取最高分类别。**注意：****`_embed_text()`**** 会优先尝试调用 ****`self.client.embeddings.create(model="voyage-3-lite", ...)`****，但当前 Anthropic SDK 没有暴露 ****`embeddings`**** 资源，所以实际总是走 ****`_local_embedding()`**** 的字符 n\-gram 哈希向量兜底方案**——这是一个重要的真实实现细节，不是走了真正的语义向量模型，而是用 1/2/3\-gram 字符哈希构造 256 维向量做近似匹配。
 
-#### 置信度和降级
+- **Pattern 规则匹配**（`_pattern_recognize`）：先匹配细粒度关键词字典（比如"退款/退货" → `REFUND`，"401/验证码" → `TECHNICAL_LOGIN`），如果没命中再匹配粗粒度关键词字典（比如"投诉/经理" → `ESCALATION`）。打分公式是 `min(1.0, 0.5 + 0.25 * (hits - 1))`——单个关键词命中给 0\.5 分，每多命中一个关键词加 0\.25 分。
 
-识别结果不会无条件相信最高分，而是有阈值控制：
+#### 4\.1\.3 加权投票：`_vote()`
 
-- 分数够高，保留细粒度意图
-- 分数不足，回退成 `OTHER`
-- 模型失败时，优先由 Embedding 或 Pattern 接管
+```Python
+if self._embedding_enabled:
+    weights = [(llm, 0.7), (emb, 0.2), (pat, 0.1)]
+else:
+    weights = [(llm, 0.85), (pat, 0.15)]
+scores = {}
+for result, w in weights:
+    scores[result["intent"]] = scores.get(result["intent"], 0.0) + w * result["confidence"]
+best = max(scores, key=scores.get)
+```
 
-这保证了系统不会因为某一路抖动就误路由到错误 Agent。
+投票之后还有一个**细粒度纠偏规则**：如果最高票是粗粒度意图（`_GENERIC_INTENTS`），但 Pattern 给出了一个细粒度意图（`_SPECIFIC_INTENTS`）并且置信度 ≥ 0\.5，且当前最高票分数 \< 0\.8，则**用 Pattern 的细粒度意图覆盖投票结果**。这就是为什么"退款多久到账"这种话，即使 LLM/Embedding 倾向于返回宽泛的 `BILLING`，Pattern 命中"退款"关键词后也会被纠正成更精确的 `REFUND`。
 
-#### 支持的细粒度意图
+如果 LLM 调用失败（`llm.get("failed")` 为真），会跳过正常投票，优先信任 Embedding，再信任 Pattern，都没有则返回 `OTHER` \+ 置信度 0。
 
-| 意图 | 示例 |
-|---|---|
-| `order_status` | 订单现在到哪了 |
-| `logistics` | 快递什么时候到 |
-| `refund` | 退款多久到账 |
-| `invoice` | 帮我开发票 |
-| `payment_issue` | 为什么重复扣款 |
-| `technical_login` | 登录一直报 401 |
-| `technical_crash` | 应用一直崩溃 |
-| `human_handoff` | 我要找人工客服 |
+#### 4\.1\.4 输出字段：`IntentResult`
 
-#### 实体提取
+```Python
+intent: str
+confidence: float
+urgency: UrgencyLevel
+intent_group: str
+entities: Dict[str, List[str]]
+reasoning: str
+latency_ms: float
+source_scores: Dict[str, float]   # {"llm": .., "embedding": .., "pattern": ..}
+```
 
-当前实体提取是规则优先，不是每轮都让模型抽：
+这些字段会一路传递到 `ChatResponse`，`entities`、`intent_confidence`、`intent_source_scores` 都会原样暴露给调用方，方便调试和评测。
 
-- `order_id`
-- `date`
-- `amount`
-- `error_code`
+#### 4\.1\.5 实体提取：`_extract_entities()`
 
-这样做的原因很现实：
+用纯正则规则提取四类实体，不额外调用 LLM：
 
-- 这些实体非常结构化，规则提取更稳
-- 不需要额外 LLM 成本
-- 后续路由和工具调用都能直接复用
+```Python
+"order_id":  r"(?:订单号?|order(?:_id)?|#)\s*[:：#]?\s*([A-Za-z0-9_-]{4,32})"
+"date":      r"(今天|明天|昨天|本周|这周|下周|\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?)"
+"amount":    r"((?:¥|￥)\s*\d+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?\s*(?:元|块|rmb|cny|usd|美元))"
+"error_code": r"(?:error(?:_code)?|错误码|状态码|http)\s*[:：#]?\s*([45]\d{2})\b" 或 r"\b([45]\d{2})\b"
+```
 
-#### 紧急度
+这样做的原因很现实：这些实体非常结构化，规则提取更稳，不需要额外 LLM 成本，后续路由和工具调用都能直接复用。
 
-紧急度分四级：
+#### 4\.1\.6 紧急度：`_urgency()`
 
-- `LOW`
-- `MEDIUM`
-- `HIGH`
-- `CRITICAL`
+```Python
+def _urgency(self, message, intent) -> UrgencyLevel:
+    for level, kws in _URGENCY_KEYWORDS.items():
+        if any(kw in msg for kw in kws):
+            return level
+    if intent in (ESCALATION, HUMAN_HANDOFF):
+        return UrgencyLevel.HIGH
+    if intent == COMPLAINT:
+        return UrgencyLevel.MEDIUM
+    return UrgencyLevel.LOW
+```
 
-它不只是展示字段，而是会影响是否升级、是否优先转人工、是否提高路由保守程度。
+紧急度分四级（`LOW/MEDIUM/HIGH/CRITICAL`），先看关键词命中（配置在 `_URGENCY_KEYWORDS` 字典里），再看意图类别兜底。`CRITICAL` 会在路由层触发无条件升级到 `EscalationAgent`。
 
-### 4.2 Agent 编排
+#### 4\.1\.7 缓存与在线学习
+
+- **LRU 风格缓存**：`_cache_key()` 用消息文本（截断前 200 字符）\+ 最近 3 轮历史算 md5 作为 key；缓存超过 1000 条时批量删除前 500 条（简单粗暴但有效）。
+
+- **在线学习**：`learn(message, correct)` 可以把一条纠正样本加进对应意图的模板列表，并清空该类别的 Embedding 缓存和整个识别结果缓存，让下次识别能用上新样本。这是一个供人工标注/回归修正调用的接口，当前主链路里没有自动调用它。
+
+### 4\.2 Agent 编排
 
 文件：`agents/agent_orchestrator.py`
 
-编排器负责：
+编排器的核心类是 `AgentOrchestrator`，围绕它的关键数据结构有：
 
-- 识别意图
-- 计算领域分数
-- 选择主 Agent 和辅助 Agent
-- 执行单 Agent 或并行多 Agent
-- 合并响应
-- 记录路由原因和路由置信度
+- `AgentProfile`（`frozen dataclass`）：`role/mission/workflow/input_contract/output_contract/handoff_conditions/tool_scope/model/temperature/max_tokens`，这是每个 Agent 类的**类属性**，不是运行时生成的。
 
-#### 路由不是黑盒
+- `AgentStats`：`total/success/total_ms/monitor_penalty`，并提供 `routing_score()` 方法：
 
-`RoutingDecision` 会明确记录：
+```Python
+def routing_score(self) -> float:
+    latency_score = 1.0 / (1.0 + self.avg_ms / 1000)
+    base_score = self.success_rate * 0.7 + latency_score * 0.3
+    return base_score * max(0.0, 1.0 - self.monitor_penalty)
+```
 
-- 主 Agent 是谁
-- 有没有辅助 Agent
-- 为什么这样路由
-- 当前路由置信度多高
+成功率权重 0\.7，延迟权重 0\.3，再乘以 `(1 - monitor_penalty)` 折算 Monitor 反馈——这是"在线表现驱动路由"的数学核心。
 
-这点在面试里很好讲，因为它说明系统不是“碰运气选了个模型”，而是有可解释的路由层。
+#### 4\.2\.1 Agent 池：`_pool`
 
-#### 当前角色设计
+```Python
+self._pool: Dict[AgentType, List[BaseAgent]] = {
+    AgentType.GENERAL: [self._make_agent(GeneralAgent, client, model, skill_manager)],
+    AgentType.TECHNICAL: [self._make_agent(TechnicalAgent, client, model, skill_manager)],
+    AgentType.BILLING: [self._make_agent(BillingAgent, client, model, skill_manager)],
+    AgentType.ESCALATION: [self._make_agent(EscalationAgent, client, model, skill_manager)],
+}
+```
 
-| Agent | 职责 |
-|---|---|
-| `GeneralAgent` | 通用分诊与澄清 |
-| `TechnicalAgent` | 技术排障 |
-| `BillingAgent` | 账单核验 |
-| `EscalationAgent` | 人工升级交接 |
+`_make_agent()` 支持按环境变量覆盖每个角色的模型：
 
-#### 角色契约
+```Python
+env_name = f"ECHOMIND_{agent_cls.agent_type.value.upper()}_MODEL"  # 例如 ECHOMIND_TECHNICAL_MODEL
+model = os.getenv(env_name, "").strip() or profile.model
+```
 
-每个 Agent 都有自己的 `AgentProfile`，包含：
+这意味着可以给技术 Agent 配一个更强的模型，通用接待配一个更快更便宜的模型，而不用改代码。
 
-- `role`
-- `mission`
-- `workflow`
-- `input_contract`
-- `output_contract`
-- `handoff_conditions`
-- `tool_scope`
+#### 4\.2\.2 四类 Agent 的真实契约
 
-这比只靠 prompt 区分角色更可控。
+|Agent|`temperature`|`max_tokens`|`tool_scope`|关键设计|
+|---|---|---|---|---|
+|`GeneralAgent`|0\.3|900|`search_knowledge_base`、`inspect_request_context`、`suggest_required_fields`|负责首轮接待和分诊，`_build_role_packet()` 里注入 `triage_targets=["technical","billing","escalation"]`|
+|`TechnicalAgent`|0\.1|1200|`search_knowledge_base`、`lookup_error_code`、`build_diagnostic_plan`|注入 `diagnostic_fields`，明确写"不得要求密码、验证码；不得建议破坏性操作"|
+|`BillingAgent`|0\.0|1100|`search_knowledge_base`、`check_billing_fields`、`compare_amounts`|注入 `verification_fields.missing_fields`，明确写"不得承诺退款成功、立即到账"|
+|`EscalationAgent`|0\.0|500|`search_knowledge_base`、`create_handoff_summary`|**不调用 LLM**，`handle()` 被完全重写，直接拼一段固定格式的升级摘要|
 
-#### Agent 里真正差异化的东西
+`EscalationAgent.handle()` 值得单独看一下，它是唯一没有走 `BaseAgent._call_llm()` 的 Agent：
 
-现在的 Agent 差异不只是 system prompt：
+```Python
+async def handle(self, req: Request) -> AgentResponse:
+    intent = req.intent.value if req.intent else "unknown"
+    urgency = req.urgency.name if req.urgency else "UNKNOWN"
+    entities = json.dumps(req.entities or {}, ensure_ascii=False)
+    content = (
+        "我已将这个问题标记为人工升级处理。\n\n"
+        f"升级原因：意图={intent}，紧急度={urgency}\n"
+        f"已记录信息：{entities}\n"
+        "请不要发送密码、短信验证码或完整支付凭证；人工客服会根据会话记录继续核验。"
+    )
+    return AgentResponse(agent_type=self.agent_type, content=content, success=True, escalate=True, ...)
+```
 
-- 输入契约不同
-- 输出契约不同
-- 工具白名单不同
-- 需要的风险边界不同
-- temperature 和 max_tokens 也不同
+这样设计的原因是：升级节点的职责是"标准化交接"，不是"继续尝试回答"，用确定性代码而不是 LLM 生成，能保证行为可预测、不会意外编造已完成的操作。
 
-也就是说，它们已经不是“同一个模型换个提示词”，而是不同职责的运行时角色。
+#### 4\.2\.3 `BaseAgent._call_llm()`：真正的 Agentic Loop
 
-### 4.3 工具系统
+`BaseAgent._call_llm()` 实现了一个**最多 3 轮的工具调用循环**：
+
+```Python
+for _ in range(3):
+    resp = await self._client.messages.create(model=..., tools=[...], messages=messages, ...)
+    tool_uses = [block for block in resp.content if block.type == "tool_use"]
+    if not tool_uses:
+        return AgentCallResult(content=extract_text_content(resp.content), ...)
+    messages.append({"role": "assistant", "content": resp.content})
+    tool_results = []
+    for block in tool_uses:
+        spec = tools.get(name)
+        if spec is None:
+            result = {"success": False, "error": "工具不在白名单中"}
+        else:
+            self._validate_tool_input(spec, args)   # 校验 JSON Schema
+            result = await spec.handler(req, args)  # 执行，支持同步/异步
+        tool_results.append({"type": "tool_result", "tool_use_id": ..., "content": json.dumps(result)})
+    messages.append({"role": "user", "content": tool_results})
+raise AgentCallError("工具调用超过最大轮数", tools_used, tool_traces)
+```
+
+每一步都会记录 `tool_traces`（工具名、输入、是否成功、耗时、是否命中缓存、是否经过重排、错误信息），这份明细最终会被 `AgentOrchestrator._record_tool_trace()` 存进一个 `deque(maxlen=200)`，供 `/trace/tool/{request_id}` 和 `/trace/tools` 接口查询——这是一套完整的**请求级可观测性**设计，不是只留日志。
+
+`_build_system_prompt()` 会把角色契约拼进 system prompt：
+
+```Python
+profile_prompt = (
+    f"[角色契约]\n角色：{profile.role}\n职责：{profile.mission}\n"
+    f"处理流程：{' -> '.join(profile.workflow)}\n"
+    f"可用输入：{'；'.join(profile.input_contract)}\n"
+    f"输出要求：{'；'.join(profile.output_contract)}\n"
+    f"升级条件：{'；'.join(profile.handoff_conditions) or '无，按通用客服规则处理'}\n"
+    f"允许的数据/工具范围：{'、'.join(profile.tool_scope) or '仅使用当前请求上下文'}\n"
+    "不要声称执行了未提供的查询、修改或退款操作；缺少证据时明确说明需要核验。"
+)
+```
+
+然后再拼一段 `SkillManager.prompt_for(req.message, agent_type)`（如果有命中的 Skills）。也就是说最终 system prompt = 固定角色 prompt \+ 角色契约文本 \+ 动态 Skills 文本，三层叠加。
+
+#### 4\.2\.4 `_route_decision()` 与 `RoutingDecision`
+
+```Python
+@dataclass
+class RoutingDecision:
+    primary_agent: AgentType
+    supporting_agents: List[AgentType] = field(default_factory=list)
+    reason: str = ""
+    confidence: float = 0.0
+
+    @property
+    def multi_agent(self) -> bool:
+        return bool(self.supporting_agents)
+```
+
+`routing_reason` 是一段人类可读的调试字符串，例如：
+
+```Plaintext
+intent=technical_login, group=technical, primary=technical, supporting=billing, scores=[technical=0.93, billing=0.75, general=0.10]
+```
+
+这直接暴露在 `ChatResponse.routing_reason` 里，调试路由问题时不需要翻源码，看返回值就知道为什么选了这个 Agent。
+
+#### 4\.2\.5 `run()` vs `run_parallel()`
+
+`AgentOrchestrator.run()` 的完整判断顺序：
+
+1. 如果 `req.intent is None`（调用方没提前识别），先识别一次。
+
+2. `_needs_clarification()` 命中则直接返回澄清话术，不进入路由。
+
+3. `_route_decision()` 得到 `RoutingDecision`。
+
+4. 如果 `decision.multi_agent` 为真（有辅助 Agent），转发到 `run_parallel()`。
+
+5. 否则执行 `_execute(req, decision.primary_agent)`，再检查是否需要升级（`response.escalate` 或紧急度 `CRITICAL` 或意图属于升级类）。
+
+`run_parallel()`：
+
+```Python
+tasks = [self._execute(req, at) for at in decision.agent_types]
+responses = await asyncio.gather(*tasks, return_exceptions=True)
+valid_responses = [r for r in responses if isinstance(r, AgentResponse)]
+combined = await self._composer.compose(req, valid_responses)
+```
+
+用 `asyncio.gather(..., return_exceptions=True)` 保证一个 Agent 抛异常不会拖垮另一个 Agent 的结果。
+
+### 4\.3 工具系统
 
 文件：`agents/tools.py`
 
-工具已集中管理，并按角色白名单暴露：
+工具已集中管理，并按角色白名单暴露。核心数据结构是 `AgentToolSpec`：
 
-- 通用工具
-- 技术工具
-- 账单工具
-- 升级工具
-- 共享 RAG 工具
+```Python
+@dataclass(frozen=True)
+class AgentToolSpec:
+    name: str
+    description: str
+    input_schema: Dict[str, Any]   # JSON Schema
+    handler: AgentToolHandler       # (req, args) -> Any，支持同步或异步
+```
 
-#### 典型工具
+#### 4\.3\.1 当前真实的工具清单
 
-- `inspect_request_context`
-- `suggest_required_fields`
-- `lookup_error_code`
-- `build_diagnostic_plan`
-- `check_billing_fields`
-- `compare_amounts`
-- `create_handoff_summary`
-- `search_knowledge_base`
+|工具|所属角色|做什么|明确不做什么|
+|---|---|---|---|
+|`inspect_request_context`|通用|返回当前请求的意图/紧急度/实体快照|不查询外部业务系统|
+|`suggest_required_fields`|通用|按意图类型建议下一轮该问用户什么字段|—|
+|`lookup_error_code`|技术|解释 401/403/404/500 等错误码含义和排查方向|明确标记 `server_log_checked: False`，不读服务端日志|
+|`build_diagnostic_plan`|技术|按环境和是否可复现生成排障步骤顺序|不执行修改配置等操作|
+|`check_billing_fields`|账单|检查订单号/金额/日期/支付渠道等核验字段是否齐全|明确标记 `can_confirm_refund: False`，不连接订单或支付系统|
+|`compare_amounts`|账单|计算用户提供的两笔金额差值|明确标记不代表"重复扣款"或"退款"结论|
+|`create_handoff_summary`|升级|生成交接给人工的结构化摘要|明确标记 `sensitive_data_required: False`，不创建真实工单|
+|`search_knowledge_base`|共享（所有角色）|调用 `MCPToolManager.search_with_rewrite()` 做查询改写\+并行召回\+重排|—|
 
-#### 设计要点
+工具文件开头的注释直接说明了设计原则：
 
-- 工具参数有 JSON Schema
-- 编排器会做参数校验
-- 工具只暴露白名单
-- RAG 是所有 Agent 共享能力
+> 订单查询、退款执行、账单修改等需要真实业务系统授权的动作不在这里伪造。
 
-#### 为什么要集中到一个文件
+这是一个非常重要的工程取舍——所有工具返回的都是"确定性的、可验证的判断"（比如字段是否齐全、金额差多少），而不是伪造一个"退款已完成"之类的假结果。
 
-工具集中后有三个好处：
+#### 4\.3\.2 工具参数校验
 
-1. **更容易审计**：一眼能看到每个工具能做什么
-2. **更容易复用**：共享 RAG 不用在多个 Agent 里重复写
-3. **更容易控制风险**：不会出现某个 Agent 误调用不该有的能力
+`make_tool()` 统一生成带 `additionalProperties: False` 的 JSON Schema：
 
-#### 工具设计原则
+```Python
+def make_tool(name, description, properties, handler, required=None) -> AgentToolSpec:
+    return AgentToolSpec(
+        name=name, description=description,
+        input_schema={"type": "object", "properties": properties, "required": required or [], "additionalProperties": False},
+        handler=handler,
+    )
+```
 
-- 工具必须确定性强
-- 工具必须尽量可解释
-- 工具不伪造外部系统结果
-- 工具只返回“可以确认的事实”或“明确的降级结果”
+`BaseAgent._validate_tool_input()` 会在真正调用 handler 之前检查：必填字段是否存在、是否有未声明的多余字段（`additionalProperties: False`）、每个字段的类型是否匹配 schema 声明。校验失败直接抛 `ValueError`，工具调用记录为失败，但不会中断整个对话（LLM 会收到错误信息，可以选择换个参数重试或换个说法回答）。
 
-这和客服场景是匹配的，因为客服最怕的是“模型编了一个看似合理但实际不对的操作结果”。
+#### 4\.3\.3 共享 RAG 工具的实现细节
 
-### 4.4 三级记忆
+`build_shared_rag_tools(tool_manager)` 返回的 `search_knowledge_base` 是一个闭包函数，内部直接调用 `tool_manager.search_with_rewrite("knowledge_search", query, top_k=top_k)`——也就是说，**Agent 调用这个工具时，会触发完整的查询改写 \+ 并行召回 \+ LLM 重排链路**（详见 4\.5 节），不是简单的向量检索一次。
+
+### 4\.4 三级记忆
 
 文件：`memory/conversation_memory.py`
 
-当前是三层记忆：
+核心类是 `MemoryManager`，几个关键常量：
 
-| 记忆层 | 存储 | 作用 |
-|---|---|---|
-| 工作记忆 | Redis | 当前会话最近消息 |
-| 情景记忆 | ChromaDB | 历史对话摘要，支持语义检索 |
-| 用户画像 | ChromaDB | 长期偏好和关键实体 |
+```Python
+WORKING_MAX   = 20    # 工作记忆最大条数
+COMPRESS_AT   = 15    # 达到此条数触发压缩
+HISTORY_TOP_K = 5     # 情景记忆检索返回条数
+SUMMARY_MAX_CHARS = 800
+PROFILE_DOC_PREFIX = "user_profile:"
+```
 
-#### 当前实现特点
+#### 4\.4\.1 三层存储
 
-- 工作记忆超过阈值会压缩
-- 摘要采用合并更新，不再无限拼接
-- 情景记忆检索优先当前会话，再回退到同用户全局检索
-- 用户画像按 `user_id` 稳定存储
-- `to_prompt_text()` 只拼最近少量消息，避免上下文过长
+|记忆层|存储|Redis/ChromaDB Key|作用|
+|---|---|---|---|
+|工作记忆|Redis List|`wm:{user_id}:{conv_id}`，TTL 24h|当前会话最近消息，`lpush` 写入（最新在前）|
+|会话摘要|Redis String|`summary:{user_id}:{conv_id}`，TTL 24h|压缩后的历史摘要|
+|情景记忆|ChromaDB `episodic` collection|按 `user_id`/`conv_id` metadata 过滤|压缩后的旧对话全文，供跨轮语义检索|
+|用户画像|ChromaDB `user_profile` collection|`user_profile:{user_id}`|长期偏好和实体，按用户全局稳定存储|
 
-#### 为什么要分三层
+初始化时 ChromaDB 客户端有一个降级策略：
 
-如果只保留最近对话，系统会忘记用户长期偏好。  
-如果只保留长期画像，系统会失去当前上下文。  
-如果把所有历史全塞进 prompt，又会触发上下文爆炸。
+```Python
+try:
+    chroma = chromadb.HttpClient(host=chroma_host, port=chroma_port, ...)
+    chroma.heartbeat()
+except Exception:
+    chroma = chromadb.PersistentClient(path=chroma_path, ...)
+```
 
-所以三层记忆本质上是在做“时间尺度分离”：
+优先连接独立 ChromaDB 服务（Docker Compose 场景），连不上就自动退化为本地嵌入式模式——这意味着即使 ChromaDB 容器没启动，服务本身也不会直接崩溃。
 
-- 工作记忆管当前轮
-- 情景记忆管跨会话线索
-- 用户画像管长期偏好
+#### 4\.4\.2 `get_context()`：构建完整记忆上下文
 
-#### 现在的优化方向
+```Python
+async def get_context(self, user_id, conv_id, query="") -> MemoryContext:
+    recent = await self._get_working_memory(user_id, conv_id)
+    history = await self._search_episodic(user_id, conv_id, query or (recent[-1].content if recent else ""))
+    profile = await self._get_profile(user_id)
+    summary = await self._redis.get(self._summary_key(user_id, conv_id)) or ""
+    return MemoryContext(recent_messages=recent, relevant_history=history, user_profile=profile, summary=summary)
+```
 
-当前这层已经比最初稳定很多，但后续还可以继续做：
+四类信息一次性打包成 `MemoryContext`，再由 `to_prompt_text()` 格式化：
 
-- 摘要更结构化，显式记录“待办、风险、实体、结论”
-- 检索加入时间衰减
-- 画像按字段合并，而不是整块重写
-- 对高价值实体做显式索引
+```Python
+def to_prompt_text(self) -> str:
+    parts = []
+    if self.summary: parts.append(f"[会话摘要]\n{summary}")
+    if self.relevant_history: parts.append("[相关历史]\n" + "\n".join(f"- {h}" for h in history[:3]))
+    if self.user_profile: parts.append(f"[用户画像]\n{json.dumps(profile)}")
+    if self.recent_messages: parts.append("[最近对话]\n" + "\n".join(f"{role}: {content}" for m in recent[-8:]))
+    return "\n\n".join(parts)
+```
 
-这些都能进一步减少“记住了，但没记对”的问题。
+注意：即使 `get_context()` 拿到了工作记忆里的全部消息，`to_prompt_text()` 最终也**只拼最近 8 条**，相关历史**只拼前 3 条**——这是双重的上下文长度控制。
 
-### 4.5 知识库与 RAG
+#### 4\.4\.3 情景记忆检索：先当前会话，再全局兜底
+
+```Python
+async def _search_episodic(self, user_id, conv_id, query) -> List[str]:
+    results = await self._query_episodic(query, n_results=5, where={"user_id": ..., "conv_id": ...})
+    docs = self._extract_docs(results)
+    if len(docs) < 5:
+        fallback = await self._query_episodic(query, n_results=5, where={"user_id": ...})  # 去掉 conv_id 限制
+        docs.extend(self._extract_docs(fallback))
+    return self._dedupe_texts(docs)[:5]
+```
+
+先严格按当前会话检索，不够 5 条时再放宽到"同用户所有会话"补齐，兼顾精确性和召回率。
+
+#### 4\.4\.4 压缩与摘要合并
+
+已在 3\.5 节详细讲解，这里补充一点：`_merge_summary()` 用的 prompt 明确要求保留"用户偏好、关键实体、待办事项、约束条件、未解决问题"，这五类信息是摘要压缩时优先保留的内容类别，而不是简单的"内容概括"。
+
+#### 4\.4\.5 用户画像：增量更新而不是覆盖
+
+`update_profile()` 会先读旧画像，把旧画像和最近 10 条消息一起交给 LLM：
+
+```Python
+prompt = f"""从以下对话和已有用户画像中提炼或更新用户偏好和关键实体，返回 JSON。
+对话:\n{text}\n已有画像:\n{profile_ctx}\n
+返回格式: {{"preferences": ["..."], "entities": {{"产品": [], "问题类型": []}}}}"""
+```
+
+然后先 `delete` 旧文档再 `add` 新文档（同一个 `doc_id`），实现"整体替换但内容是增量融合"的效果——这不是简单的 append，而是每次都让 LLM 看到旧画像后决定怎么合并。
+
+### 4\.5 知识库与 RAG
 
 文件：`mcp/tool_manager.py`、`mcp/knowledge_base.py`
 
-知识库链路包括：
+#### 4\.5\.1 `KnowledgeBase`：真实的 ChromaDB 检索
 
-1. 查询改写
-2. 并行召回
-3. 合并去重
-4. LLM 重排
-5. Top-K 注入上下文
+`KnowledgeBase` 用独立的 `knowledge_base` collection（和记忆用的 `episodic`/`user_profile` 是不同 collection，互不干扰）。几个关键点：
 
-知识库不是独立演示功能，而是接入了 `/chat` 主链路。
+- **文档切片**：`_chunk_text()` 按句号/换行切分，每片不超过 500 字符，尽量保持语义完整。
 
-#### 为什么要先看意图再查知识库
+- **写入是 ****`upsert`**：`doc_id = md5(f"{title}_{i}_{chunk[:50]}")`，同样内容重复导入是幂等的。
 
-不是所有请求都值得检索：
+- **首次启动自动导入默认文档**：如果 collection 为空，会自动调用 `_load_default_docs()` 导入 6 篇默认知识文档（退款政策、订单查询、账户安全、技术故障排查、会员积分、配送说明）——这也是为什么刚部署完就能直接体验知识库检索效果，不需要手动导入。
 
-- 问候、反馈、转人工不需要查
-- 明确的技术排障需要查技术文档
-- 账单问题需要查政策和流程
+- **相似度计算**：`score = round(1.0 - distance, 4)`，ChromaDB 返回的是距离，这里转成"相似度"数值方便展示。
 
-如果所有问题都盲目检索，系统会：
+#### 4\.5\.2 检索优化链路：`search_with_rewrite()`
 
-- 增加延迟
-- 引入无关上下文
-- 让模型被噪声干扰
+这是 `MCPToolManager` 里最核心的方法，完整过程：
 
-所以这里做了“意图驱动检索”，而不是“见词就搜”。
+```Python
+async def search_with_rewrite(self, tool_name, query, top_k=5, context=None) -> ToolResult:
+    sub_queries = await self.rewrite_query(query, n=3)          # 1. 查询改写
+    tasks = [self.call(tool_name, {"query": q, "top_k": max(top_k, 5)}, context) for q in sub_queries]
+    results = await asyncio.gather(*tasks, return_exceptions=True)  # 2. 并行召回
 
-#### 工具可靠性设计
+    seen, merged = set(), []                                     # 3. 合并去重（按内容 md5）
+    for r in results:
+        if isinstance(r, ToolResult) and r.success:
+            for item in r.data:
+                key = hashlib.md5(str(item).encode()).hexdigest()
+                if key not in seen:
+                    seen.add(key); merged.append(item)
 
-RAG 工具不是直接查一下就完了，还加了：
+    reranked = await self._rerank(query, merged, top_k)          # 4. LLM 重排
+    return ToolResult(success=True, data=reranked, reranked=True)
+```
 
-- 参数校验
-- 缓存
-- 超时
-- 熔断
-- fallback
+**查询改写**（`rewrite_query`）用 LLM 把原始查询扩写成 3 个不同角度的子查询，比如"退款流程"会被改写成`["如何申请退款", "退款需要多少天", "退款政策是什么"]`（并保留原始查询，去重后一起用于并行召回）。这样能覆盖单一查询召回不全的问题。
 
-这是很典型的生产化处理方式，因为检索系统也会坏，不能把主对话链路一起拖垮。
+**结果重排**（`_rerank`）用 LLM 对合并后的候选结果打分排序，只取 Top\-K：
 
-### 4.6 Skills 动态注入
+```Python
+prompt = f"""根据用户查询，对以下检索结果按相关性打分，返回 JSON 数组。
+返回格式（按相关性降序排列的索引列表）: [最相关的索引, ..., 最不相关的索引]"""
+order = json.loads(...)
+reranked = [items[i] for i in order if 0 <= i < len(items)]
+```
+
+如果结果数量本来就 ≤ top\_k，`_rerank()` 会直接跳过 LLM 调用，原样返回——避免不必要的调用开销。查询改写或重排任一环节 LLM 调用失败，都有明确的兜底（改写失败用原始查询；重排失败按原始顺序截断），任何一步失败都不会导致整个检索链路挂掉。
+
+#### 4\.5\.3 工具可靠性设计：`MCPToolManager.call()`
+
+`call()` 方法是所有工具调用（不只是知识库）的统一入口，执行顺序是：
+
+```Plaintext
+缓存检查 -> 熔断检查 -> 参数校验 -> asyncio.wait_for 超时控制 -> 执行 handler -> 可选重排 -> 写缓存
+```
+
+- **缓存**：`_cache_key()` 用工具名 \+ 参数 \+ `rerank_top_k` 算 md5，命中缓存直接返回，**并且统计上算作一次成功调用**（`tool.stats.success += 1`），不会拉低成功率统计。
+
+- **熔断器**（`CircuitBreaker`）：三态机（`CLOSED -> OPEN -> HALF_OPEN -> CLOSED`），连续失败达到 `failure_threshold`（默认 5）次后打开熔断，`recovery_s`（默认 60 秒）后进入半开态放行一次探测请求。
+
+- **超时**：`asyncio.wait_for(handler(...), timeout=tool.timeout_s)`（默认 30 秒）。
+
+- **降级**（`_fallback_result`）：熔断打开、超时、执行异常这三种情况都会走 `tool.fallback` 回调；知识库注册时配的 `knowledge_fallback` 会返回一段"知识库暂时不可用"的说明性文字而不是抛错。
+
+- **参数校验**（`_validate_params`）：按 JSON Schema 的 `required` 和 `properties.type` 检查，类型映射覆盖 `string/number/integer/boolean/array/object`。
+
+#### 4\.5\.4 要不要检索由 Agent 自己决定，不是外层按意图强制判断
+
+不是所有请求都值得检索：问候、反馈、转人工通常不需要查，明确的技术排障需要查技术文档，账单问题需要查政策和流程。**当前实现里，这个"要不要检索"的判断权完全交给了 Agent 自己**——`/chat` 路由里不存在任何 `_should_use_knowledge()` 之类的预判断函数，也不会在调用 Agent 之前先查一次知识库再把结果拼进 context。真实流程是：各 Agent 的 `tool_scope` 里都声明了 `search_knowledge_base`，工具本身作为 `tools` 参数传给 LLM（见 4\.2\.3 节 `BaseAgent._call_llm()` 的 Agentic Loop），LLM 会根据 system prompt 里的角色契约、当前问题和 Skills 规范，自主判断这一轮要不要发起 `tool_use` 调用这个工具——可能调用 0 次、1 次，也可能在同一轮对话里因为需要澄清结果而调用多次（最多 3 轮工具调用）。
+
+这带来两个直接影响：
+
+- `ChatResponse.knowledge_used` 字段不是提前计算好的固定值，而是在拿到 `OrchestratorResult` 之后**反查** `"search_knowledge_base" in result.tools_used` 得到的——因为在生成回复之前，谁也不知道 Agent 这一轮会不会调用知识库。
+
+- 排查"为什么没查知识库"时，不能只看意图识别结果，而要看 system prompt（角色契约 \+ Skills）有没有引导 Agent 去检索，以及通过 `/trace/tool/{request_id}` 确认 LLM 本轮的 `tool_use` 输出里是否真的包含这次调用（详见 6\.7 节）。
+
+### 4\.6 Skills 动态注入
 
 文件：`core/skill_loader.py`
 
-Skills 用于把客服规范、处理边界、角色约束动态注入到 Agent 的 system prompt。
+核心类 `SkillManager`，数据模型 `Skill`：
 
-适合表达：
+```Python
+@dataclass
+class Skill:
+    name: str
+    description: str
+    content: str
+    path: str
+    keywords: List[str] = field(default_factory=list)
+    agents: List[str] = field(default_factory=list)
+    enabled: bool = True
 
-- 技术 Agent 如何排障
-- 账单 Agent 不能承诺退款
-- 通用 Agent 先澄清再处理
+    def matches(self, message, agent_type=None) -> bool:
+        if not self.enabled: return False
+        if self.agents and agent_type and agent_type.lower() not in self.agents: return False
+        if not self.keywords: return True   # 无关键词 = 全局注入
+        return any(keyword.lower() in message.lower() for keyword in self.keywords)
+```
 
-支持热加载，不需要重启服务。
+#### 4\.6\.1 文件发现规则
 
-#### Skills 和工具的区别
+`_discover_files()` 优先扫描所有 `SKILL.md`（目录规范写法，如 `skills/technical_support/SKILL.md`），再扫描目录下其余 `.md/.txt/.json` 文件（跳过隐藏文件和 `README.md`）。当前项目内置三个 Skill 目录：
 
-- **工具**解决“能做什么”
-- **Skills**解决“应该怎么做”
+```Plaintext
+skills/general_customer_service/SKILL.md
+skills/technical_support/SKILL.md
+skills/billing_support/SKILL.md
+```
 
-比如：
+#### 4\.6\.2 Front Matter 解析：不依赖 PyYAML
 
-- 工具可以检查账单字段是否齐全
-- Skills 会告诉账单 Agent 不能承诺退款到账时间
+`_split_front_matter()` 自己实现了一个极简的 `key: value` 解析器，专门处理 Markdown 顶部 `---` 包裹的元信息块：
 
-这个分层很重要，因为它让业务规范可以独立更新，而不必改代码。
+```Python
+def _split_front_matter(self, raw: str) -> tuple[Dict[str, Any], str]:
+    text = raw.lstrip()
+    if not text.startswith("---"):
+        return {}, raw
+    lines = text.splitlines()
+    meta: Dict[str, Any] = {}
+    end_idx = None
+    for idx, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            end_idx = idx
+            break
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        meta[key.strip()] = value.strip().strip("\"'")
+    return meta, "\n".join(lines[end_idx + 1:])
+```
 
-### 4.7 Monitor 与降权
+代码注释里直接写明了动机：
+
+> 这里刻意不用 PyYAML，避免为一个轻量配置格式新增运行时依赖。
+
+也就是说 Skill 的 front matter 只支持简单的单行 `key: value`，不支持嵌套结构或列表语法——`keywords`/`agents` 这类多值字段是通过 `_as_list()` 按逗号（中英文逗号均可）切分字符串得到的，不是 YAML 数组。
+
+一个真实的 Skill front matter 示例（对应 `skills/technical_support/SKILL.md`）：
+
+```Markdown
+---
+name: 技术支持处理规范
+description: 适用于 TechnicalAgent 的故障排查和升级处理规范
+keywords: 报错,错误,接口,API,部署,超时,500,401,日志
+agents: technical
+enabled: true
+---
+```
+
+如果文件没有 front matter，`name` 会退化为"正文第一个 Markdown 标题"（`_first_heading()`），再退化为"文件所在目录名"（如果文件名是 `SKILL.md`）或"文件名本身"（其他情况）。
+
+#### 4\.6\.3 命中判断与 Prompt 拼接：`prompt_for()`
+
+```Python
+def prompt_for(self, message: str, agent_type: Optional[str] = None) -> str:
+    blocks: List[str] = []
+    remaining = self.max_prompt_chars   # 默认 5000
+    for skill in self._skills:
+        if not skill.matches(message, agent_type):
+            continue
+        block = skill.to_prompt_block()  # 单个 Skill 最多 3200 字符
+        if len(block) > remaining:
+            block = block[:remaining].rstrip() + "\n..."
+        blocks.append(block)
+        remaining -= len(block)
+        if remaining <= 0:
+            break
+    if not blocks:
+        return ""
+    return (
+        "以下是当前请求可用的 EchoMind Skills。"
+        "请优先遵循这些业务规则；如果与系统角色冲突，以系统角色和安全边界为准。\n\n"
+        + "\n\n".join(blocks)
+    )
+```
+
+两层长度控制：单个 Skill 最多 3200 字符（`Skill.to_prompt_block(max_chars=3200)`），全部注入内容加起来不超过 `ECHOMIND_SKILLS_MAX_PROMPT_CHARS`（默认 5000）。超出预算会直接截断并追加 `"\n..."`，保证不会无限挤占对话上下文。
+
+`matches()` 的判断顺序：`enabled=False` 直接跳过 → 声明了 `agents` 但当前 Agent 不在列表里则跳过 → 没有声明 `keywords` 则视为全局 Skill，任何请求都会注入 → 否则只有消息里命中至少一个关键词才注入。这意味着：**Skills 不是给所有 Agent 全量注入的，而是"按角色 \+ 按关键词"精确匹配后才拼进 system prompt**。
+
+每次调用 `prompt_for()` 都会打日志（命中则 `logger.info`，未命中则 `logger.debug`），日志里包含匹配到的 Skill 名称和具体命中的关键词，方便排查"为什么这条 Skill 没生效"。
+
+#### 4\.6\.4 热加载：不用重启进程
+
+`reload()` 本质就是重新调用一次 `load()`，重新扫描目录、重新解析所有文件。单个文件解析失败不会影响其他 Skill（`load()` 内部用 `try/except` 包住每个文件的加载，失败信息记录进 `self._errors`，其余文件继续正常加载）。
+
+`POST /skills/reload` 接口调用后，还会额外调用 `_orchestrator.set_skill_manager(_skill_manager)`：
+
+```Python
+def set_skill_manager(self, skill_manager) -> None:
+    self._skill_manager = skill_manager
+    self._composer._skill_manager = skill_manager
+    for agents in self._pool.values():
+        for agent in agents:
+            agent._skill_manager = skill_manager
+```
+
+这一步把新的 `SkillManager` 引用同步给了**所有已创建的 Agent 实例和 ResponseComposer**，因为 Agent 对象在整个进程生命周期里是复用的（不会每次请求都重新创建），如果不主动同步引用，reload 之后 Agent 手里还拿着旧的 `SkillManager` 对象。
+
+### 4\.7 Monitor 与降权
 
 文件：`monitor/performance_monitor.py`
 
-Monitor 会采集：
+核心类 `PerformanceMonitor`，类文档字符串直接写明了它和路由的关系：
 
-- Agent 成功率
-- Agent 平均延迟
-- 工具成功率
-- 工具平均延迟
+```Plaintext
+Monitor 采集 → 发现某 Agent 成功率下降 →
+Orchestrator.get_stats() 中该 Agent 的 routing_score 自动降低 →
+_best_agent() 路由时自动绕开该 Agent
+```
 
-并把异常反馈给路由层，影响后续 `routing_score()`。
+#### 4\.7\.1 采集循环：`_collect()`
 
-#### 路由为什么要吃监控结果
+`PerformanceMonitor` 启动后会以 `interval_s`（默认 10 秒，环境变量 `MONITOR_INTERVAL`）为周期跑一个后台循环 `_loop()`，每次调用 `_collect()`：
 
-因为静态路由不够现实。  
-一个 Agent 即使逻辑上最适合，实际在线上也可能出现：
+```Python
+async def _collect(self) -> None:
+    agent_stats = self._orchestrator.get_stats()
+    tool_stats  = self._tool_manager.get_stats()
+    routing_penalties: Dict[str, float] = {}
 
-- 成功率下降
-- 延迟变高
-- 工具依赖异常
+    for agent_key, s in agent_stats.items():
+        sr, ms = s["success_rate"], s["avg_ms"]
+        anomaly = self._detector.record(f"agent_success_rate:{agent_key}", sr)  # 异常检测
+        self._check_threshold("agent_success_rate", sr, agent_key)              # 阈值告警
+        self._check_threshold("agent_avg_ms", ms, agent_key)
+        routing_penalties[agent_key] = self._routing_penalty(sr, ms)            # 计算降权系数
 
-Monitor 的作用就是把“运行时健康度”纳入路由，让系统能绕开状态变差的节点。
+    for tool_name, s in tool_stats.items():
+        ...
+        if s["consecutive_fails"] >= 3:
+            self._add_suggestion(...)   # 连续失败 3 次生成具体优化建议
 
-### 4.8 端到端评测
+    self._orchestrator.update_routing_penalties(routing_penalties)  # 写回 Orchestrator
+    self._generate_routing_suggestions(agent_stats)
+```
+
+关键点：**Monitor 不需要额外埋点**，它读取的 `agent_stats`/`tool_stats` 就是 `AgentOrchestrator`/`MCPToolManager` 在处理真实请求时实时累积更新的统计数据（`AgentStats.total/success/total_ms`、`ToolStats.total/success/failed/consecutive_fails`）。
+
+#### 4\.7\.2 降权公式：`_routing_penalty()`
+
+```Python
+@staticmethod
+def _routing_penalty(success_rate: float, avg_ms: float) -> float:
+    penalty = 0.0
+    if success_rate < 0.90:
+        penalty += min(0.5, (0.90 - success_rate) * 2)
+    if avg_ms > 3000:
+        penalty += min(0.4, (avg_ms - 3000) / 10000)
+    return min(penalty, 0.9)
+```
+
+成功率每低于 90% 一点，扣分翻倍（最多扣 0\.5）；平均延迟每超过 3000ms，按比例扣分（最多扣 0\.4）；两项叠加封顶 0\.9（不会让某个 Agent 被彻底禁用，留出 10% 的机会）。这个 `penalty` 会通过 `update_routing_penalties()` 写回 `AgentStats.monitor_penalty`，再影响前面提到的 `routing_score()` 公式，以及 `AgentOrchestrator._monitor_degraded()` 的降级判断。
+
+#### 4\.7\.3 异常检测：`AnomalyDetector`
+
+除了固定阈值告警，Monitor 还用了一个基于滑动窗口 Z\-Score 的异常检测器（`AnomalyDetector.record()`），检测指标是否出现统计意义上的突变（不只是"低于固定阈值"，而是"和自己的历史值相比是否异常"）。两套机制并存：固定阈值适合"红线"，Z\-Score 适合发现"相对自己历史的突然恶化"。
+
+#### 4\.7\.4 告警与建议
+
+- **阈值告警**（`THRESHOLDS` 字典）：`agent_success_rate < 0.90` → `ERROR`；`tool_success_rate < 0.95` → `WARNING`；`agent_avg_ms > 3000` → `WARNING`；`tool_avg_ms > 5000` → `ERROR`。触发后记录 `Alert` 并可选异步推送 Webhook（`ALERT_WEBHOOK_URL`）。
+
+- **路由优化建议**（`_generate_routing_suggestions()`）：某 Agent 成功率 \< 0\.85 且样本量 \> 10 时，生成一条带优先级的 `Suggestion`，内容明确写"Orchestrator 的 `_best_agent()` 已自动降低该 Agent 的路由权重"，并给出人工排查方向（检查 prompt、检查问题复杂度、考虑增加同类型实例）。
+
+- **建议去重**：`_add_suggestion()` 按 `title` 去重，同一个问题不会重复堆积一堆一样的建议。
+
+#### 4\.7\.5 `/monitor` 接口返回什么
+
+```Python
+def summary(self) -> Dict[str, Any]:
+    return {
+        "agent_stats":   self._orchestrator.get_stats(),
+        "tool_stats":    self._tool_manager.get_stats(),
+        "active_alerts": [asdict(a) for a in self._alerts if not a.resolved][-10:],
+        "suggestions":   [{"title": s.title, "action": s.action, "priority": s.priority}
+                          for s in sorted(self._suggestions, key=lambda x: -x.priority)[:5]],
+    }
+```
+
+只暴露最近 10 条未解决告警和优先级最高的 5 条建议，不是把全部历史数据都吐出来。
+
+### 4\.8 端到端评测
 
 文件：`evaluation/evaluator.py`
 
-评测包括：
+评测分两条独立链路，分别由 `IntentEvaluator` 和 `EndToEndEvaluator` 负责，最终由 `EndToEndEvaluator.run()` 统一编排产出一份 `EvalReport`。
 
-- 意图识别 Accuracy
-- Macro-F1
-- LLM-as-Judge 四维评分
-- 回归检测
-- 优化建议
+#### 4\.8\.1 意图识别评测：`IntentEvaluator.evaluate()`
 
-LLM-as-Judge 评分维度：
+```Python
+async def evaluate(self, cases: List[IntentTestCase]) -> Dict[str, Any]:
+    for case in cases:
+        result = await self._recognizer.recognize(case.message)
+        predictions.append(result.intent.value)
+        ground_truth.append(case.expected_intent)
 
-- 相关性
-- 准确性
-- 完整性
-- 有用性
+    accuracy = correct / len(predictions)
+    for label in sorted(set(ground_truth + predictions)):
+        tp = sum(p == label and g == label for p, g in zip(predictions, ground_truth))
+        fp = sum(p == label and g != label for p, g in zip(predictions, ground_truth))
+        fn = sum(p != label and g == label for p, g in zip(predictions, ground_truth))
+        prec, rec = tp / (tp + fp or 1), tp / (tp + fn or 1)
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+    macro_f1 = statistics.mean(v["f1"] for v in per_class.values())
+```
 
-#### 为什么要做这个
+**注意这里没有用 sklearn**，Accuracy、Precision/Recall/F1、Macro\-F1 全部是纯 Python 手写计算——项目依赖清单（`requirements.txt`）里确实也没有引入 `scikit-learn`，这是一个刻意的轻量化设计。
 
-如果没有评测，系统优化会变成纯感觉：
+内置了 11 条默认意图测试用例（`DEFAULT_INTENT_CASES`），覆盖 `logistics/request/complaint/technical_crash/payment_issue/human_handoff/greeting/account/invoice/refund/technical_login` 等细粒度类别，开箱即用无需额外准备标注数据。
 
-- 你可能觉得 prompt 更好了
-- 但实际意图识别可能更差了
-- 你可能觉得回复更长了
-- 但用户体验反而更糟
+#### 4\.8\.2 端到端对话评测：`LLMJudge` \+ `EndToEndEvaluator`
 
-所以评测是为了把“感觉”变成“指标”。
+`LLMJudge.judge()` 用固定模板 prompt，要求 LLM 从四个维度打分并返回 JSON：
 
-#### 适合面试怎么说
+```Python
+JUDGE_PROMPT = """你是一个客服质量评估专家。请对以下客服响应进行评分。
+用户问题: {question}
+Agent 响应: {response}
+{context_section}
+请从以下四个维度评分（0.0-1.0），返回 JSON：
+- relevance: 响应是否直接针对用户问题
+- accuracy: 信息是否准确无误
+- completeness: 是否完整解决了用户需求
+- helpfulness: 用户能否据此采取行动
+"""
+```
 
-可以说：
+`QualityScores` 有一个 `overall` 属性（四个维度的平均值，具体权重在数据类里定义），`EndToEndEvaluator.PASS_THRESHOLD = 0.75` 作为及格线。
 
-> 我不仅做了多 Agent 编排，还把意图识别和回复质量都接进了评测链路，支持 Accuracy、Macro-F1 和 LLM-as-Judge 四维评分，能做回归检测。
+`_evaluate_dialog_case()` 是评测的核心方法，**它是真实调用 ****`AgentOrchestrator.run()`**** 拿到的回复，不是预置答案**：
 
-## 5. 重点代码阅读顺序
+```Python
+async def _evaluate_dialog_case(self, case, case_idx) -> List[EvalResult]:
+    questions = self._dialog_turns(case)   # 支持 {"question": "..."} 单轮 或 {"turns": [...]} 多轮
+    history: List[Dict[str, str]] = []
+    for turn_idx, question in enumerate(questions):
+        context = self._history_context(history)
+        orch_req = OrcReq(message=question, user_id=..., conv_id=..., context=context, history=history[-6:])
+        orch_result = await self._orchestrator.run(orch_req)   # 真实跑一遍主链路
+        scores = await self._judge.judge(question, orch_result.response, context=context)
+        history.append({"role": "user", "content": question})
+        history.append({"role": "assistant", "content": orch_result.response})
+```
 
-建议按这个顺序看：
+这意味着**多轮评测用例会真实模拟一个持续对话**，每一轮都把上一轮的问答拼进 `history` 再传给下一轮，用来测试系统在多轮场景下是否还能保持上下文一致性。内置 5 条默认对话用例（`DEFAULT_DIALOG_CASES`），其中最后一条是三轮对话（"你好我想退款" → "订单号是 \#12345" → "退款多久能到账？"）。
 
-1. [api/main.py](/Users/xiao_xiong/Desktop/code/EchoMind/api/main.py)
-2. [core/intent_recognizer.py](/Users/xiao_xiong/Desktop/code/EchoMind/core/intent_recognizer.py)
-3. [agents/agent_orchestrator.py](/Users/xiao_xiong/Desktop/code/EchoMind/agents/agent_orchestrator.py)
-4. [agents/tools.py](/Users/xiao_xiong/Desktop/code/EchoMind/agents/tools.py)
-5. [memory/conversation_memory.py](/Users/xiao_xiong/Desktop/code/EchoMind/memory/conversation_memory.py)
-6. [mcp/tool_manager.py](/Users/xiao_xiong/Desktop/code/EchoMind/mcp/tool_manager.py)
-7. [mcp/knowledge_base.py](/Users/xiao_xiong/Desktop/code/EchoMind/mcp/knowledge_base.py)
-8. [core/skill_loader.py](/Users/xiao_xiong/Desktop/code/EchoMind/core/skill_loader.py)
-9. [monitor/performance_monitor.py](/Users/xiao_xiong/Desktop/code/EchoMind/monitor/performance_monitor.py)
-10. [evaluation/evaluator.py](/Users/xiao_xiong/Desktop/code/EchoMind/evaluation/evaluator.py)
+#### 4\.8\.3 回归检测与优化建议
 
-### 5.1 为什么这个顺序最省力
+```Python
+def _detect_regressions(self, current: Dict[str, float]) -> List[str]:
+    prev = self._history[-1] if self._history else self._baseline
+    for metric, value in current.items():
+        if metric in prev.avg_scores and prev.avg_scores[metric] > 0:
+            delta = (value - prev.avg_scores[metric]) / prev.avg_scores[metric]
+            if delta < -0.05:   # 退化超过 5%
+                regressions.append(f"{metric}: {prev} → {value} (退化 {abs(delta):.1%})")
+```
 
-这个顺序是从“请求入口”往“支撑系统”走：
+基线来源有两个：内存里的 `self._history`（本次进程内之前跑过的评测结果，优先使用最近一次）和磁盘上的 `baseline.json`（`EVAL_BASELINE_PATH`，默认 `/app/data/eval/baseline.json`），进程重启后也能继续和历史基线对比。**每次 ****`run()`**** 跑完都会自动 ****`_save_baseline()`**，也就是说最近一次评测结果会自动成为下一次评测的新基线——这是一种"滚动基线"策略，而不是固定不变的黄金标准。
 
-- 先看入口，知道系统怎么收请求
-- 再看识别，知道系统怎么理解问题
-- 再看编排，知道系统怎么决定谁来处理
-- 再看工具和记忆，知道系统怎么补上下文
-- 再看知识库和 Skills，知道系统怎么带业务规则
-- 最后看监控和评测，知道系统怎么持续变好
+`_recommendations()` 是规则驱动的建议生成器，按固定阈值给出具体建议，例如意图准确率低于 90% 建议"增加 Few\-shot 示例或补充训练数据"，`completeness` 偏低建议"Agent 可能过早结束回答，考虑在 prompt 中要求提供完整解决方案"。所有指标都达标时输出"所有指标均达标，继续保持"。
 
-## 6. 使用指南
+## 5\. 使用指南
 
-### 6.1 项目结构
+### 5\.1 项目结构
 
-```text
-api/            HTTP 入口
-agents/         Agent、路由、工具
-core/           意图识别、Skills、LLM 工具
-memory/         三级记忆
-mcp/            知识库和工具管理
-monitor/        在线监控
-evaluation/     评测
-skills/         动态技能文档
+```Plaintext
+api/            HTTP 入口（main.py：lifespan 初始化 + 全部路由）
+agents/         Agent、路由、工具（agent_orchestrator.py + tools.py）
+core/           意图识别、Skills 加载、LLM 工具（intent_recognizer.py + skill_loader.py + llm_utils.py）
+memory/         三级记忆（conversation_memory.py）
+mcp/            知识库和工具管理（knowledge_base.py + tool_manager.py）
+monitor/        在线监控（performance_monitor.py）
+evaluation/     评测（evaluator.py）
+skills/         动态技能文档（general_customer_service / technical_support / billing_support）
+data/           持久化数据（chroma/ 向量库、eval/baseline.json 评测基线）
 wiki/           项目文档
+tests/          单元测试（test_agent_orchestrator.py、test_knowledge_base.py）
 ```
 
 这套结构本身也适合在面试时解释：
 
-- `core` 是“理解层”
-- `agents` 是“决策和执行层”
-- `memory` 是“上下文层”
-- `mcp` 是“外部知识和工具层”
-- `monitor` 和 `evaluation` 是“治理层”
+- `core` 是"理解层"（把自然语言变成结构化信息）
 
-### 6.2 环境准备
+- `agents` 是"决策和执行层"（路由 \+ 工具调用 \+ LLM 生成）
 
-核心依赖：
+- `memory` 是"上下文层"（三个时间尺度的记忆）
 
-- Anthropic API Key
-- Redis
-- ChromaDB
-- Python 运行环境
+- `mcp` 是"外部知识和工具层"（检索优化 \+ 可靠性治理）
 
-启动前通常需要配置 `.env`，至少包含：
+- `monitor` 和 `evaluation` 是"治理层"（在线反馈 \+ 离线回归）
 
-- `ANTHROPIC_API_KEY`
-- `ANTHROPIC_MODEL`
-- `REDIS_URL`
-- `CHROMA_HOST`
-- `CHROMA_PORT`
+### 5\.2 环境准备
 
-如果是本地跑，最先需要确认的是：
+核心依赖（对照 `requirements.txt`）：
 
-- Anthropic Key 是否可用
-- Redis 是否连通
-- ChromaDB 是否启动
-- `.env` 是否被加载
+- `anthropic==0.40.0`：LLM 调用；意图 Embedding 分支支持远端客户端，缺失时本地兜底
 
-因为这几个组件任何一个缺失，都会影响主链路。
+- `fastapi==0.115.5` \+ `uvicorn[standard]==0.32.1` \+ `pydantic==2.10.3`
 
-### 6.3 启动方式
+- `redis==5.2.1`：异步工作记忆
+
+- `chromadb==0.5.23`：知识库 \+ 情景记忆 \+ 用户画像
+
+- `prometheus-client==0.21.1`：可选的 Prometheus 指标
+
+- `httpx==0.28.1`：Monitor 的 Webhook 告警
+
+- `python-dotenv==1.0.1`：加载 `.env`
+
+启动前至少需要在 `.env` 里配置（对照仓库内 `.env`）：
+
+```Plaintext
+ANTHROPIC_API_KEY=your_api_key
+ANTHROPIC_MODEL=deepseek-v4-pro
+ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic   # 可选，接入 DeepSeek 等兼容协议服务
+
+REDIS_PASSWORD=echomind123
+REDIS_URL=redis://:echomind123@redis:6379/0
+
+CHROMA_HOST=chromadb
+CHROMA_PORT=8000
+CHROMA_PERSIST_DIRECTORY=/app/data/chroma   # ChromaDB 服务不可用时的本地降级路径
+
+PROMETHEUS_PORT=9091
+MONITOR_INTERVAL=10
+ALERT_WEBHOOK_URL=
+```
+
+如果是本地跑，最先需要确认的是：Anthropic Key（或兼容服务 Key）是否可用、Redis 是否连通、ChromaDB 是否启动、`.env` 是否被加载（`load_dotenv()` 在 `api/main.py` 顶部调用）。因为这几个组件任何一个缺失，都会影响主链路——不过要注意，ChromaDB 连不上时代码会**自动降级为本地嵌入式模式**，不会直接崩溃，只有 `ANTHROPIC_API_KEY` 缺失会直接抛异常阻止启动（`_anthropic_cfg()`）。
+
+### 5\.3 启动方式
 
 项目支持两种常见方式：
 
-- Docker Compose 全栈启动
-- 本地开发模式运行 API
+- Docker Compose 全栈启动：`docker compose up -d --build`
 
-如果是学习代码，建议先本地跑 API；如果是验证完整链路，再用 Docker Compose。
+- 本地开发模式运行 API：`python api/main.py`（不带参数走 uvicorn HTTP 服务）或 `python api/main.py --cli`（走交互式 CLI，见 `_cli()` 函数）
 
-### 6.4 常用接口
+如果是学习代码，建议先本地跑 API；如果是验证完整链路（Nginx、Prometheus、Redis、ChromaDB 都要联动），再用 Docker Compose。
 
-| 接口 | 作用 |
+### 5\.4 常用接口
+
+|接口|作用|
 |---|---|
-| `GET /health` | 健康检查 |
-| `POST /chat` | 主对话接口 |
-| `GET /skills` | 查看 Skills |
-| `POST /skills/reload` | 热加载 Skills |
-| `GET /monitor` | 查看监控状态 |
-| `GET /metrics` | Prometheus 指标 |
-| `POST /search` | 知识库检索 |
-| `POST /knowledge/add` | 添加知识库文档 |
-| `POST /knowledge/upload` | 上传文件进知识库 |
-| `GET /knowledge/stats` | 知识库统计 |
-| `POST /eval/run` | 运行端到端评测 |
+|`GET /health`|健康检查，同时返回 `_orchestrator.get_stats()`|
+|`POST /chat`|主对话接口|
+|`GET /skills`|查看 Skills（`SkillManager.summary()`）|
+|`POST /skills/reload`|热加载 Skills，并同步给所有 Agent 实例|
+|`GET /monitor`|查看监控状态（`PerformanceMonitor.summary()`）|
+|`GET /metrics`|Prometheus 指标|
+|`POST /search?query=...&top_k=...`|演示检索优化链路（查询改写 → 并行召回 → 重排）|
+|`POST /knowledge/add`|批量添加知识库文档|
+|`POST /knowledge/upload`|上传 `.txt/.md/.json` 文件导入知识库（限 10MB）|
+|`GET /knowledge/stats`|知识库文档片段总数|
+|`POST /eval/run`|运行端到端评测（不传参数则用内置默认用例）|
+|`GET /trace/tool/{request_id}`|查看某次请求的完整工具调用明细|
+|`GET /trace/tools?limit=20`|查看最近 N 次请求的工具调用明细|
 
-其中最值得重点关注的是：
+其中最值得重点关注的是：`/chat`（真实业务主链路）、`/eval/run`（质量评测闭环）、`/skills/reload`（业务规则热更新）、`/monitor`（运行健康状态）、`/trace/tool/{request_id}`（请求级可观测性，很多类似项目不会做到这个粒度）。
 
-- `/chat`：真实业务主链路
-- `/eval/run`：质量评测闭环
-- `/skills/reload`：业务规则热更新
-- `/monitor`：运行健康状态
-
-### 6.5 `/chat` 是怎么走的
+### 5\.5 `/chat` 是怎么走的
 
 一次请求里，`/chat` 的关键动作其实是：
 
-1. 先从 memory 拿上下文
-2. 再从 intent recognizer 得到结构化判断
-3. 再由 orchestrator 决定主辅 Agent
-4. 再按需查知识库
-5. 再让 Agent 生成回复
-6. 再把本轮信息写回 memory
+1. 先从 `MemoryManager.get_context()` 拿上下文（工作记忆 \+ 情景记忆 \+ 用户画像 \+ 会话摘要）
 
-这条链路的重点是：**每一步都可插拔、可观测、可回放**。
+2. 再从 `IntentRecognizer.recognize()` 得到结构化判断（`intent/intent_group/urgency/entities/confidence`）
 
-### 6.6 调试记忆
+3. 再由 `AgentOrchestrator._route_decision()` 决定主辅 Agent
+
+4. Agent 在 `_call_llm()` 的 Agentic Loop 里按需自主调用 `search_knowledge_base` 等工具（最多 3 轮工具调用）
+
+5. 再把结果写回 `MemoryManager.add_message()`
+
+6. 最后用 `asyncio.create_task()` 异步触发 `update_profile()`，不阻塞响应返回
+
+这条链路的重点是：**每一步都可插拔、可观测、可回放**——`request_id` 贯穿全程，`/trace/tool/{request_id}` 能查到这次请求里每一次工具调用的输入、耗时、是否命中缓存、是否重排、是否失败。
+
+### 5\.6 调试记忆
 
 如果要排查上下文问题，优先看：
 
-- Redis 工作记忆
-- Redis summary
-- ChromaDB `episodic`
-- ChromaDB `user_profile`
+- Redis 工作记忆：`wm:{user_id}:{conv_id}`
 
-一般排障顺序是：
+- Redis 会话摘要：`summary:{user_id}:{conv_id}`
 
-1. 先看工作记忆有没有写进去
-2. 再看摘要有没有生成
-3. 再看情景记忆有没有存成功
-4. 最后看画像是否更新
+- ChromaDB `episodic` collection（按 `user_id`/`conv_id` metadata 过滤）
 
-这样能快速判断问题是在写入、压缩还是检索。
+- ChromaDB `user_profile` collection（文档 ID 是 `user_profile:{user_id}`）
 
-### 6.7 调试知识库
+一般排障顺序：先看工作记忆有没有写进去（`add_message()` 是否成功 `lpush`）→ 再看条数是否达到 `COMPRESS_AT=15` 触发了压缩 → 再看摘要有没有合并成功（`_merge_summary()` 是否报错退化为拼接截断）→ 再看情景记忆有没有存成功 → 最后看画像是否更新（注意画像更新是异步的，`/chat` 返回后可能还没执行完）。
 
-如果 `/chat` 没有触发知识库：
+### 5\.7 调试知识库
 
-- 先看意图是否属于业务类
-- 再看 `_should_use_knowledge()` 的判断
-- 最后看 `knowledge_search` 是否成功返回结果
+如果 Agent 没有调用知识库：知识库检索现在完全由 Agent 自主决定是否调用 `search_knowledge_base` 工具，所以要先看 system prompt 里的角色契约和 Skills 是否引导 Agent 去检索，再看 LLM 本轮的 `tool_use` 输出里是否真的包含这次调用（可以通过 `/trace/tool/{request_id}` 直接查看）。
 
 如果知识库结果不准，通常排查这几个点：
 
-- 查询改写是否偏题
-- 召回是否太少
-- 重排是否把关键文档压下去了
-- 注入上下文时是否截断过多
+- `rewrite_query()` 生成的子查询是否偏题（日志里会打印 `查询改写: {query} → {sub_queries}`）
 
-### 6.8 调试路由
+- `KnowledgeBase.search()` 召回是否太少（可以直接调 `POST /search` 单独测试）
 
-如果 Agent 选错了，通常看三处：
+- `_rerank()` 是否把关键文档排到后面（重排失败会退化为原始顺序，日志会有 `重排失败，返回原始顺序` 的告警）
 
-- `intent_group` 是否正确
-- `RoutingDecision` 的 `routing_reason`
-- `AgentStats.routing_score()` 是否被降权影响
+- 文档切片（`_chunk_text()`，每片 500 字符）是否把关键信息切断在了两个片段的交界处
 
-这比单看最终回复更有用，因为路由问题通常不是在生成阶段出现的。
+### 5\.8 调试路由
 
-### 6.9 评测建议
+如果 Agent 选错了，通常看这几处：
+
+- `intent_group` 是否正确（`ChatResponse.intent_group` 字段）
+
+- `ChatResponse.routing_reason` 里的完整打分明细，例如 `intent=..., group=..., primary=..., supporting=..., scores=[...]`
+
+- `GET /health` 或 `GET /monitor` 里对应 Agent 的 `monitor_penalty` 和 `routing_score`，确认是否被 Monitor 降权到触发了 `_monitor_degraded()`
+
+这比单看最终回复更有用，因为路由问题通常不是在生成阶段出现的，而是在打分、降权、协作目标判断这几步。
+
+### 5\.9 评测建议
 
 建议优先跑：
 
-1. 意图识别用例
-2. 对话质量用例
-3. 回归基线
+1. 意图识别用例（`DEFAULT_INTENT_CASES`，11 条内置用例）
 
-这样能比较快定位问题是出在识别、路由还是回复质量。
+2. 对话质量用例（`DEFAULT_DIALOG_CASES`，5 条内置用例，含一条三轮多轮场景）
 
-如果是拿来面试，最好能讲出：
+3. 对比 `data/eval/baseline.json` 里的滚动基线，看 `regressions` 字段是否为空
 
-- 哪个指标代表识别能力
-- 哪个指标代表生成质量
-- 哪个指标代表系统稳定性
-- 哪个指标代表回归风险
+如果是拿来面试，最好能讲出：意图识别的 Accuracy/Macro\-F1 代表识别能力；`relevance/accuracy/completeness/helpfulness` 四维 LLM\-as\-Judge 分数代表生成质量；Agent `success_rate`/`avg_ms` 代表系统稳定性；`regressions` 列表代表回归风险。这样面试官会觉得你不是只会"调一个能跑的系统"，而是真的懂怎么衡量它。
 
-这样面试官会觉得你不是只会“调一个能跑的系统”，而是真的懂怎么衡量它。
+## 6\. 面试可讲亮点
 
-## 7. 面试可讲亮点
+- 我做的是一个多 Agent 客服编排系统，不是单一聊天机器人——四类 Agent 各自有 `AgentProfile`（角色契约）和独立的工具白名单，不是共用一个 prompt 换几个字。
 
-如果你要拿这个项目去面试，可以优先讲这几句：
+- 意图识别用了 LLM、Embedding 和 Pattern 三路融合，并有加权投票和细粒度纠偏规则（粗粒度票数领先但 Pattern 给出高置信度细粒度意图时会被纠正）。
 
-- 我做的是一个多 Agent 客服编排系统，不是单一聊天机器人。
-- 意图识别用了 LLM、Embedding 和 Pattern 三路融合。
-- Agent 不只是 prompt 不同，还做了角色契约和工具白名单。
-- 记忆分成工作记忆、情景记忆和用户画像三层。
-- 系统有知识库、监控、评测和路由降权闭环。
-- 多 Agent 支持主辅协作，不是简单命中一个模型就结束。
+- 路由不是死板的 if\-else，而是按意图、关键词、结构化实体打分，主 Agent 和辅助 Agent 是动态计算出来的，并且有两层降级（Monitor 降权过滤 \+ 执行失败兜底）。
 
-如果面试官继续追问，你可以进一步展开：
+- 记忆分成工作记忆、情景记忆和用户画像三层，压缩时用 LLM 生成摘要并和旧摘要合并，用户画像按用户全局增量更新而不是按会话存储。
 
-- 为什么要三路意图融合，而不是只用一个模型
-- 为什么要把工具抽到统一文件里
-- 为什么要把记忆分成三层
-- 为什么要让知识库进入主链路
-- 为什么要让监控结果反馈到路由
+- 知识库检索有完整的查询改写 → 并行召回 → 合并去重 → LLM 重排链路，工具调用层还有缓存、熔断器、超时和降级。
 
-这些问题都能自然地把项目讲深。
+- 系统有 Monitor 在线监控和路由降权闭环（成功率和延迟直接转成 `monitor_penalty` 影响 `routing_score`），还有端到端评测闭环（Accuracy/Macro\-F1 \+ LLM\-as\-Judge 四维评分 \+ 滚动基线回归检测）。
 
-## 8. 常见问题
+- 多 Agent 支持主辅协作，不是简单命中一个模型就结束——复合问题会 `asyncio.gather()` 并行调用多个 Agent，再由 `ResponseComposer` 用一次额外的 LLM 调用合并成一条连贯回复。
 
-### 8.1 为什么不是直接用一个大模型回答
+进一步展开：
 
-因为真实客服场景里，单模型容易：
+- 为什么要三路意图融合，而不是只用一个模型——三种方法互补不同的失败模式，LLM 语义强但贵、Embedding 稳但对业务边界不敏感、Pattern 零延迟但覆盖窄。
 
-- 分流不准
-- 上下文断裂
-- 无法约束业务边界
-- 没法做评测和治理
+- 为什么要把工具抽到统一文件里——集中审计、共享 RAG 复用、避免越权调用。
 
-### 8.2 为什么要有多个 Agent
+- 为什么要把记忆分成三层——时间尺度分离，当前轮、跨轮线索、长期偏好互不冲突。
 
-因为不同业务域的输入、风险边界和工具都不同。
+- 为什么要让知识库检索交给 Agent 自主决定，而不是外层强制——因为不同角色对"要不要查、查什么"的判断标准不一样，写死在外层反而不灵活；工具本身的可靠性治理（缓存、熔断、降级）已经保证了即使频繁调用也不会拖垮系统。
 
-### 8.3 为什么不是把所有能力都塞进一个大 Prompt
+- 为什么要让监控结果反馈到路由——线上表现是动态的，静态路由无法应对某个 Agent 突然变慢或成功率下降的情况。
 
-因为那样会出现三个问题：
+这些问题都能自然地把项目讲深，而且每个回答都能落到具体的类名、方法名或公式上，不是空对空。
 
-- 角色边界不清
-- 工具权限不清
-- 出错后难定位
 
-拆成多个 Agent 后，每个角色都可以独立调优、独立评测、独立降权。
 
-### 8.4 为什么要做三层记忆
+## 7\. 总结
 
-因为单轮历史不够，长期用户信息也不能每次都塞进 prompt。
+EchoMind 的核心不是"会聊天"，而是把客服系统里最关键的几件事工程化了：
 
-### 8.5 为什么要做评测
+- 识别问题（三路融合 \+ 加权投票 \+ 细粒度纠偏）
 
-因为没有评测，就很难知道是模型、路由、知识库还是工具出了问题。
+- 分配角色（打分路由 \+ 主辅协作 \+ 双层降级）
 
-### 8.6 为什么要做监控
+- 调用工具（JSON Schema 校验 \+ 白名单 \+ 确定性结果）
 
-因为线上系统不是静态的。模型、工具、知识库、延迟、失败率都会变化，必须有运行时治理。
+- 维护记忆（三层记忆 \+ LLM 压缩合并 \+ 增量画像）
 
-## 9. 一句话总结
+- 接入知识库（查询改写 \+ 并行召回 \+ LLM 重排 \+ 熔断降级）
 
-EchoMind 的核心不是“会聊天”，而是把客服系统里最关键的几件事工程化了：
+- 监控质量（在线降权闭环，秒级反馈到路由）
 
-- 识别问题
-- 分配角色
-- 调用工具
-- 维护记忆
-- 接入知识库
-- 监控质量
-- 量化评测
-
-如果再压缩成一句面试话术，可以说：
-
-> 我做的是一个可观测、可评测、可降级的多 Agent 客服编排系统，把意图识别、路由、知识检索、记忆、Skills、监控和评测串成了完整闭环。
+- 量化评测（Accuracy/Macro\-F1 \+ LLM\-as\-Judge \+ 滚动基线回归）
 
